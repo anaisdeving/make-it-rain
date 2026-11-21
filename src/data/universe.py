@@ -100,13 +100,20 @@ def load_index_universe(
             cache.write("universe", cur_key, cur_df)
             cache.write("universe", rem_key, rem_df)
         for rec in cur_df.to_dict("records"):
-            members.setdefault(rec["symbol"], UniverseMember(**_clean(rec)))
+            for m in _expand(UniverseMember(**_clean(rec))):
+                members.setdefault(m.symbol, m)
         if include_removed_since is not None:
             for rec in rem_df.to_dict("records"):
-                m = UniverseMember(**_clean(rec))
-                if m.removed_on and m.removed_on >= include_removed_since:
-                    members.setdefault(m.symbol, m)
+                for m in _expand(UniverseMember(**_clean(rec))):
+                    if m.removed_on and m.removed_on >= include_removed_since:
+                        members.setdefault(m.symbol, m)
     return sorted(members.values(), key=lambda m: m.symbol)
+
+
+def _expand(m: UniverseMember) -> list[UniverseMember]:
+    """Dual-class rows such as ``UAA/UA`` list one ticker per share class."""
+    parts = [p.strip() for p in m.symbol.split("/") if p.strip()]
+    return [m.model_copy(update={"symbol": p}) for p in parts] if len(parts) > 1 else [m]
 
 
 def _clean(rec: dict) -> dict:
