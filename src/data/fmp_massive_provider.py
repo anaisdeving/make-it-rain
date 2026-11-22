@@ -2,9 +2,10 @@
 and Massive, formerly Polygon.io (daily bars + splits).
 
 Both are optional. :func:`src.data.factory.build_provider` composes them with the
-yfinance fallback per capability, so a single key upgrades only what it covers.
-Endpoint schemas follow the vendors' public docs; they were not exercised live in
-Phase 0 because no keys were available (see docs/report).
+yfinance fallback per capability and per symbol, so a key upgrades only what its plan
+actually serves. FMP plans gate endpoints and symbols (HTTP 402/403); denied requests
+fall back instead of failing the run, and are never cached so a plan upgrade takes
+effect on the next run.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time as _time
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,19 @@ from src.data.provider_base import MarketDataProvider
 from src.domain.models import AnnouncementTiming, BarSeries, EarningsEvent, UniverseMember
 
 log = logging.getLogger(__name__)
+
+# Consecutive denials after which an endpoint is skipped for the rest of the process.
+# Plans whitelist a few large caps, so a handful of denials is conclusive.
+DENIAL_TRIP = 5
+TIMING_MATCH_DAYS = 2
+
+
+class FMPAccessDenied(Exception):
+    """The key is valid but the plan does not cover this endpoint, parameter or symbol."""
+
+    def __init__(self, path: str, status: int, message: str) -> None:
+        super().__init__(f"{path}: HTTP {status}: {message}")
+        self.path, self.status, self.message = path, status, message
 
 
 class RateLimiter:
@@ -49,18 +64,37 @@ class _HttpClient:
         self._key = api_key
         self.limiter = RateLimiter(calls_per_minute)
         self.session = requests.Session()
+        self.calls = 0
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self._key, "<redacted>") if self._key else text
 
     def get(self, path: str, **params: Any) -> Any:
         params[self.key_param] = self._key
         for attempt in range(4):
             self.limiter.wait()
+            self.calls += 1
             resp = self.session.get(f"{self.base_url}{path}", params=params, timeout=30)
             if resp.status_code == 429:
                 _time.sleep(2 ** (attempt + 2))
                 continue
-            resp.raise_for_status()
+            if resp.status_code in (401, 402, 403):
+                raise FMPAccessDenied(path, resp.status_code, self._redact(_error_text(resp))[:200])
+            if resp.status_code >= 400:
+                # requests' own HTTPError message embeds the full URL, key included.
+                raise requests.HTTPError(f"{path}: HTTP {resp.status_code}", response=resp)
             return resp.json()
         raise RuntimeError(f"rate limited: {path}")
+
+
+def _error_text(resp: requests.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text.strip()
+    if isinstance(body, dict):
+        return str(body.get("Error Message") or body.get("message") or body)
+    return str(body)
 
 
 def _fmp_timing(raw: str | None) -> AnnouncementTiming:
@@ -85,29 +119,56 @@ def _num(v: Any) -> float | None:
 
 
 class FMPProvider:
-    """Earnings (with BMO/AMC + revenue), historical market cap, universe incl. delisted."""
+    """Earnings (EPS + revenue), historical market cap, universe incl. delisted.
+
+    Methods return ``None`` when the plan denies the request, distinct from an empty result.
+    """
 
     name = "fmp"
 
     def __init__(self, api_key: str, base_url: str, cache_root: Path, calls_per_minute: int = 250) -> None:
         self.http = _HttpClient(base_url, "apikey", api_key, calls_per_minute)
         self.cache = DiskCache(cache_root, "fmp")
+        self._denials: Counter[str] = Counter()
+        self.denied: dict[str, str] = {}
 
-    def universe(self) -> list[UniverseMember]:
+    def _get(self, endpoint: str, path: str, **params: Any) -> Any:
+        """Fetch, or raise FMPAccessDenied; trips a per-endpoint breaker after repeated denials."""
+        if self._denials[endpoint] >= DENIAL_TRIP:
+            raise FMPAccessDenied(path, 0, "skipped: endpoint repeatedly denied for this plan")
+        try:
+            data = self.http.get(path, **params)
+        except FMPAccessDenied as exc:
+            self._denials[endpoint] += 1
+            if self._denials[endpoint] == DENIAL_TRIP or endpoint not in self.denied:
+                log.warning("FMP denied %s (%d so far): %s", endpoint, self._denials[endpoint], exc.message)
+            self.denied[endpoint] = exc.message
+            raise
+        self._denials[endpoint] = 0
+        return data
+
+    def universe(self) -> list[UniverseMember] | None:
         cached = self.cache.read("universe", "fmp_universe")
         if cached is None:
             rows: list[dict[str, Any]] = []
-            for exch in ("NYSE", "NASDAQ"):
-                data = self.http.get(
-                    "/stable/company-screener",
-                    exchange=exch, isEtf="false", isFund="false", isActivelyTrading="true",
-                    marketCapMoreThan=150_000_000, marketCapLowerThan=20_000_000_000, limit=10000,
-                )
-                rows += [{"symbol": d["symbol"], "name": d.get("companyName"), "exchange": exch,
-                          "removed_on": None, "source": "fmp:screener"} for d in data]
+            try:
+                for exch in ("NYSE", "NASDAQ"):
+                    data = self._get(
+                        "company-screener", "/stable/company-screener",
+                        exchange=exch, isEtf="false", isFund="false", isActivelyTrading="true",
+                        marketCapMoreThan=150_000_000, marketCapLowerThan=20_000_000_000, limit=10000,
+                    )
+                    rows += [{"symbol": d["symbol"], "name": d.get("companyName"), "exchange": exch,
+                              "removed_on": None, "source": "fmp:screener"} for d in data]
+            except FMPAccessDenied:
+                return None
             page = 0
-            while True:
-                data = self.http.get("/stable/delisted-companies", page=page, limit=100)
+            while page <= 200:
+                try:
+                    data = self._get("delisted-companies", "/stable/delisted-companies", page=page, limit=100)
+                except FMPAccessDenied:
+                    log.warning("FMP delisted list truncated at page %d by plan; survivorship gap remains", page)
+                    break
                 if not data:
                     break
                 for d in data:
@@ -115,8 +176,6 @@ class FMPProvider:
                         rows.append({"symbol": d["symbol"], "name": d.get("companyName"), "exchange": d["exchange"],
                                      "removed_on": d.get("delistedDate"), "source": "fmp:delisted"})
                 page += 1
-                if page > 200:
-                    break
             cached = pd.DataFrame(rows)
             self.cache.write("universe", "fmp_universe", cached)
         out = []
@@ -126,26 +185,27 @@ class FMPProvider:
                                       source=r["source"], removed_on=None if pd.isna(rem) else rem.date()))
         return out
 
-    def earnings(self, symbol: str) -> list[EarningsEvent]:
+    def earnings(self, symbol: str) -> list[EarningsEvent] | None:
         df = self.cache.read("earnings", symbol)
         if df is None and self.cache.status("earnings", symbol) != "empty":
             try:
-                data = self.http.get(f"/api/v3/historical/earning_calendar/{symbol}")
-            except requests.HTTPError:
-                data = self.http.get("/stable/earnings", symbol=symbol, limit=100)
+                data = self._get("earnings", "/stable/earnings", symbol=symbol, limit=100)
+            except FMPAccessDenied:
+                return None
             df = pd.DataFrame(data or [])
             self.cache.write("earnings", symbol, df if not df.empty else None, "ok" if not df.empty else "empty")
         if df is None or df.empty:
             return []
         events = []
         for r in df.to_dict("records"):
-            eps_a = _num(r.get("eps", r.get("epsActual")))
+            eps_a = _num(r.get("epsActual", r.get("eps")))
             if eps_a is None:
                 continue
             eps_e = _num(r.get("epsEstimated"))
-            rev_a = _num(r.get("revenue", r.get("revenueActual")))
+            rev_a = _num(r.get("revenueActual", r.get("revenue")))
             rev_e = _num(r.get("revenueEstimated"))
             d = pd.Timestamp(r["date"]).to_pydatetime()
+            # /stable/earnings carries no time-of-day; only legacy payloads had "time".
             timing = _fmp_timing(r.get("time"))
             if timing == AnnouncementTiming.BMO:
                 d = datetime.combine(d.date(), datetime.min.time()).replace(hour=7)
@@ -163,8 +223,11 @@ class FMPProvider:
         key = f"{symbol}_{start}_{end}"
         df = self.cache.read("mcap", key)
         if df is None and self.cache.status("mcap", key) != "empty":
-            data = self.http.get("/stable/historical-market-capitalization", symbol=symbol,
-                                 **{"from": start.isoformat(), "to": end.isoformat()}, limit=5000)
+            try:
+                data = self._get("historical-market-capitalization", "/stable/historical-market-capitalization",
+                                 symbol=symbol, **{"from": start.isoformat(), "to": end.isoformat()}, limit=5000)
+            except FMPAccessDenied:
+                return None
             df = pd.DataFrame(data or [])
             if df.empty:
                 self.cache.write("mcap", key, None, "empty")
@@ -212,8 +275,30 @@ class MassiveProvider:
         return series
 
 
+def merge_fallback_timing(events: list[EarningsEvent], fallback: list[EarningsEvent]) -> list[EarningsEvent]:
+    """Fill UNKNOWN timing on keyed events from the nearest fallback event of the same symbol.
+
+    Only timing and the announcement timestamp are taken; EPS/revenue stay from the keyed source.
+    """
+    by_symbol: dict[str, list[EarningsEvent]] = {}
+    for f in fallback:
+        if f.timing != AnnouncementTiming.UNKNOWN:
+            by_symbol.setdefault(f.symbol, []).append(f)
+    out = []
+    for e in events:
+        if e.timing == AnnouncementTiming.UNKNOWN:
+            cands = [f for f in by_symbol.get(e.symbol, [])
+                     if abs((f.announced_at.date() - e.announced_at.date()).days) <= TIMING_MATCH_DAYS]
+            if cands:
+                best = min(cands, key=lambda f: abs((f.announced_at.date() - e.announced_at.date()).days))
+                e = e.model_copy(update={"timing": best.timing, "announced_at": best.announced_at,
+                                         "source": f"{e.source}+{best.source}:timing"})
+        out.append(e)
+    return out
+
+
 class FMPMassiveProvider(MarketDataProvider):
-    """Composite: each capability uses its keyed source when available, else ``fallback``."""
+    """Composite: each capability uses its keyed source when the plan serves it, else ``fallback``."""
 
     name = "fmp_massive"
 
@@ -226,13 +311,26 @@ class FMPMassiveProvider(MarketDataProvider):
         if fmp is None and massive is None:
             raise ValueError("FMPMassiveProvider needs at least one keyed source")
         self.fmp, self.massive, self.fallback = fmp, massive, fallback
+        self.is_synthetic = fallback.is_synthetic
+        self.field_sources: dict[str, Counter[str]] = {
+            k: Counter() for k in ("universe", "bars", "earnings", "timing", "revenue", "market_cap")
+        }
+        self._mcap_memo: dict[tuple[tuple[str, ...], date, date], dict[str, pd.Series]] = {}
 
     def get_universe(self, as_of: date | None = None) -> list[UniverseMember]:
-        return self.fmp.universe() if self.fmp else self.fallback.get_universe(as_of)
+        members = self.fmp.universe() if self.fmp else None
+        if members is None:
+            members = self.fallback.get_universe(as_of)
+            self.field_sources["universe"][self.fallback.name] += len(members)
+        else:
+            self.field_sources["universe"]["fmp"] += len(members)
+        return members
 
     def get_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, BarSeries]:
         if not self.massive:
-            return self.fallback.get_daily_bars(symbols, start, end)
+            out = self.fallback.get_daily_bars(symbols, start, end)
+            self.field_sources["bars"][self.fallback.name] += len(out)
+            return out
         out: dict[str, BarSeries] = {}
         for s in symbols:
             try:
@@ -242,6 +340,7 @@ class FMPMassiveProvider(MarketDataProvider):
                 b = None
             if b is not None:
                 out[s] = b
+        self.field_sources["bars"]["massive"] += len(out)
         return out
 
     def get_benchmark_bars(self, start: date, end: date, symbol: str = "SPY") -> BarSeries:
@@ -253,32 +352,77 @@ class FMPMassiveProvider(MarketDataProvider):
 
     def get_earnings_calendar(self, symbols: list[str], start: date, end: date) -> list[EarningsEvent]:
         if not self.fmp:
-            return self.fallback.get_earnings_calendar(symbols, start, end)
-        out: list[EarningsEvent] = []
+            out = self.fallback.get_earnings_calendar(symbols, start, end)
+            self._count_events(out)
+            return out
+        keyed: list[EarningsEvent] = []
+        uncovered: list[str] = []
         for s in symbols:
-            out += [e for e in self.fmp.earnings(s) if start <= e.announced_at.date() <= end]
+            ev = self.fmp.earnings(s)
+            if ev is None:
+                uncovered.append(s)
+            else:
+                keyed += [e for e in ev if start <= e.announced_at.date() <= end]
+        fb_symbols = sorted(set(uncovered) | {e.symbol for e in keyed
+                                              if e.timing == AnnouncementTiming.UNKNOWN})
+        fb = self.fallback.get_earnings_calendar(fb_symbols, start, end) if fb_symbols else []
+        uncovered_set = set(uncovered)
+        out = merge_fallback_timing(keyed, [e for e in fb if e.symbol not in uncovered_set])
+        out += [e for e in fb if e.symbol in uncovered_set]
+        self._count_events(out)
         return out
+
+    def _count_events(self, events: list[EarningsEvent]) -> None:
+        fs = self.field_sources
+        for e in events:
+            base, _, timing_src = e.source.partition("+")
+            fs["earnings"][base] += 1
+            if e.timing == AnnouncementTiming.UNKNOWN:
+                fs["timing"]["unknown"] += 1
+            else:
+                fs["timing"][timing_src.split(":")[0] if timing_src else base] += 1
+            fs["revenue"][base if e.revenue_surprise_pct is not None else "missing"] += 1
+
+    def _market_caps(self, symbols: list[str], start: date, end: date) -> dict[str, pd.Series]:
+        key = (tuple(symbols), start, end)
+        if key not in self._mcap_memo:
+            out = {}
+            for s in symbols:
+                m = self.fmp.market_cap(s, start - timedelta(days=10), end) if self.fmp else None
+                if m is not None and len(m):
+                    out[s] = m
+            self._mcap_memo[key] = out
+        return self._mcap_memo[key]
 
     def get_shares_outstanding(self, symbols: list[str], start: date, end: date) -> dict[str, pd.Series]:
-        return {} if self.fmp else self.fallback.get_shares_outstanding(symbols, start, end)
+        covered = self._market_caps(symbols, start, end)
+        rest = [s for s in symbols if s not in covered]
+        shares = self.fallback.get_shares_outstanding(rest, start, end) if rest else {}
+        self.field_sources["market_cap"]["fmp"] += len(covered)
+        self.field_sources["market_cap"][f"{self.fallback.name}:shares_x_price"] += len(shares)
+        return shares
 
     def get_market_cap_history(self, symbols: list[str], start: date, end: date) -> dict[str, pd.Series]:
-        if not self.fmp:
-            return {}
-        out = {}
-        for s in symbols:
-            m = self.fmp.market_cap(s, start - timedelta(days=10), end)
-            if m is not None and len(m):
-                out[s] = m
-        return out
+        return self._market_caps(symbols, start, end)
 
     def describe(self) -> dict[str, str]:
         fb = self.fallback.describe()
-        return {
+        out = {
             "provider": self.name,
-            "synthetic": "False",
+            "synthetic": str(self.fallback.is_synthetic),
             "bars": "Massive (Polygon) daily aggregates" if self.massive else fb.get("bars", ""),
-            "earnings": "FMP earnings calendar (BMO/AMC, EPS + revenue)" if self.fmp else fb.get("earnings", ""),
-            "universe": "FMP screener + delisted companies" if self.fmp else fb.get("universe", ""),
-            "market_cap": "FMP historical market cap" if self.fmp else fb.get("market_cap", ""),
+            "earnings": "FMP /stable/earnings (EPS + revenue) per symbol where the plan allows, else "
+                        + fb.get("earnings", "") if self.fmp else fb.get("earnings", ""),
+            "universe": "FMP screener + delisted companies, else " + fb.get("universe", "")
+                        if self.fmp else fb.get("universe", ""),
+            "market_cap": "FMP historical market cap where the plan allows, else " + fb.get("market_cap", "")
+                          if self.fmp else fb.get("market_cap", ""),
         }
+        for field, counts in self.field_sources.items():
+            if +counts:
+                out[f"source_counts_{field}"] = ", ".join(f"{k}={v}" for k, v in (+counts).most_common())
+        if self.fmp:
+            out["fmp_calls"] = str(self.fmp.http.calls)
+            for endpoint, msg in self.fmp.denied.items():
+                out[f"fmp_denied_{endpoint}"] = msg
+        return out
