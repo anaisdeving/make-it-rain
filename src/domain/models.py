@@ -37,6 +37,9 @@ class ExitReason(str, Enum):
     BREAKEVEN_STOP = "BREAKEVEN_STOP"
     TRAIL_STOP = "TRAIL_STOP"
     TIME_STOP = "TIME_STOP"
+    SIGNAL_EXIT = "SIGNAL_EXIT"
+    REBALANCE_EXIT = "REBALANCE_EXIT"
+    REGIME_EXIT = "REGIME_EXIT"
     END_OF_TEST = "END_OF_TEST"
     DATA_END = "DATA_END"      # symbol's price history ended (e.g. delisted) while held
     MANUAL = "MANUAL"
