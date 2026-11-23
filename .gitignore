@@ -23,6 +23,8 @@ env/
 
 # Data caches and generated outputs
 data/cache/
+data/sec_form4/
+data/sec_xbrl/
 outputs/
 *.sqlite
 *.sqlite3

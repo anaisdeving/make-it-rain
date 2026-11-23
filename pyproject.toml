@@ -1,0 +1,10 @@
+[project]
+name = "make-it-rain"
+version = "0.1.0"
+description = "PEAD + regime-filtered momentum US equities system: Phase 0 backtester"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

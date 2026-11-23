@@ -1,0 +1,84 @@
+# All tunable strategy thresholds, frictions and risk parameters.
+# Loaded and validated by src/config.py (pydantic-settings). Environment variables
+# prefixed with PEAD_ (nested with "__") override values here, e.g. PEAD_RISK__BASE_RISK_PER_TRADE=0.06
+
+backtest:
+  start_date: "2021-11-22"
+  end_date: "2026-11-20"
+  warmup_calendar_days: 400          # history fetched before start_date for SMA200 / 52w-high
+  initial_capital_eur: 1000.0
+  eur_usd_rate: 1.06                 # fixed conversion; FX P&L is not modelled
+  benchmark_symbol: "SPY"
+  force_close_at_end: true
+
+data:
+  provider: "auto"                   # auto | fmp_massive | yfinance | sample
+  cache_dir: "data/cache"
+  massive_base_url: "https://api.massive.com"
+  fmp_base_url: "https://financialmodelingprep.com"
+  massive_calls_per_minute: 5        # free tier
+  fmp_calls_per_minute: 250
+  yfinance_threads: 4
+  include_removed_index_members: true
+  universe_indexes: ["sp400", "sp600"]
+  sample_n_symbols: 60
+  sample_seed: 7
+
+regime:
+  sma_window: 200
+  vol_window: 20
+  normal_vol_max: 0.22               # NORMAL requires sigma_20 < 0.22
+  panic_vol_min: 0.35                # PANIC requires sigma_20 > 0.35 (and SPY < SMA200)
+  normal_min_gap: 0.05
+  caution_min_gap: 0.08
+  caution_risk_multiplier: 0.5
+  max_positions_normal: 3
+  max_positions_caution: 2
+
+screener:
+  min_market_cap: 300_000_000
+  max_market_cap: 10_000_000_000
+  min_price: 5.0
+  max_price: 150.0
+  min_avg_dollar_volume: 5_000_000
+  avg_window: 20
+  min_volume_ratio: 2.5
+  min_close_location: 0.65
+  min_eps_surprise_pct: 0.0
+  min_revenue_surprise_pct: 0.0
+  require_revenue_surprise: false    # true => events without revenue data are rejected
+  sue_threshold: 1.5
+  sue_lookback_quarters: 8
+  sue_min_quarters: 4
+  trend_sma_window: 50
+  high_52w_window: 252
+  max_distance_from_52w_high: 0.20
+  analyst_tiebreak_enabled: false    # no point-in-time analyst counts on free data
+  analyst_tiebreak_max: 8
+
+risk:
+  base_risk_per_trade: 0.05
+  max_risk_per_trade: 0.10
+  atr_window: 14
+  atr_stop_multiple: 1.5
+  max_stop_pct: 0.15
+  max_position_pct_equity: 0.50
+
+execution:
+  entry_limit_cap_pct: 0.003
+  commission_per_side_usd: 0.38
+  slippage_per_side_pct: 0.0025
+  vps_monthly_eur: 6.50
+  vps_enabled: false
+  breakeven_trigger_r: 1.5
+  trail_trigger_r: 2.0
+  trail_atr_multiple: 2.5
+  time_stop_days: 45
+  time_stop_min_r: 1.0
+  settlement_days: 1
+
+metrics:
+  periods_per_year: 252
+  risk_free_rate: 0.0
+  dsr_n_trials: 10                   # assumed number of strategy variants tried
+  dsr_trial_sharpe_std: 0.5          # assumed std of annualised Sharpe across trials
