@@ -1,14 +1,15 @@
-"""Strategy v10_coffee_can (Layer 1): Quantitative Asymmetric Compounder Backtest.
+"""Strategy v10_coffee_can_clean (Post-Bugfix Hygiene Audit).
 
-Strict Anti-Bias Protocol (ALL rules locked and 168 unit tests passed BEFORE running
-Blind OOS once; zero OOS tuning):
+Accounting-integrity rerun of the locked v10 book. This is NOT an untouched
+Blind OOS trial: the 2025-04 and 2026-04 vintages were already inspected at a341071.
+Dates, costs, and the survivorship penalty are unchanged.
 - SEC DERA Financial Statement Data Sets (XBRL): 2020q4 through 2026q3 (24 quarters,
   cached under data/sec_xbrl/).
 - Rebalance Dates: First US trading day of April each year (2022-04 through 2026-04).
 - IS Vintages:     2022-04, 2023-04, 2024-04 (evaluated over 2022-04-01..2025-03-31 & to end)
-- Blind OOS:       2025-04, 2026-04 (evaluated standalone 2025-04-01..2026-11-20 & continuous)
-- Full Window:     2022-04-01 to 2026-11-20 (4.64 years) — benchmarks computed over the
-                   IDENTICAL 2022-04..2026-11-20 window alongside saved 5Y reference figures.
+- 2025-04 / 2026-04 vintages were already inspected. Reported beside IS, not as a fresh blind trial.
+- Full Window:     2022-04-01 to 2026-11-20 — benchmarks over the identical window.
+- Live snapshot:   cleaned screener as of 2026-11-20, top 15 qualifiers.
 
 Outputs:
 - outputs/v10_coffee_can_results.json
@@ -68,6 +69,7 @@ from src.strategy.coffee_can_screener import (  # noqa: E402
     run_coffee_can_event_study,
     run_coffee_can_portfolio_backtest,
     screen_fundamentals_asof,
+    screen_replacement_candidates,
 )
 from src.strategy.ucits_etf_regime import (  # noqa: E402
     RiskOffMode,
@@ -311,14 +313,14 @@ def _plot_v10_png(
     ax1.text(
         oos_split + pd.Timedelta(days=10),
         ax1.get_ylim()[1] * 0.94,
-        "Blind OOS Start\n(2025-04)",
+        "2025-04 vintage\n(already inspected)",
         fontsize=9,
         fontweight="bold",
         color="#222222",
         va="top",
     )
     ax1.set_title(
-        f"Strategy v10_coffee_can (SEC XBRL Rule-of-40 Top-5 Compounders) — EUR {int(capital_eur):,} "
+        f"v10_coffee_can_clean (Post-Bugfix Hygiene Audit) — EUR {int(capital_eur):,} "
         f"(${int(round(capital_eur * EUR_USD_RATE)):,}) IBKR Cash Account (2022-04 to 2026-11-20)",
         fontsize=11.5,
         fontweight="bold",
@@ -424,6 +426,19 @@ def main() -> None:
             f_aud["fundamental_qualifiers_unresolved_ticker"],
         )
 
+    live_cands, live_fund_audit = screen_fundamentals_asof(
+        annual_df, SAMPLE_END, cfg_base, vintage_label="2026-11-20"
+    )
+    for c in live_cands:
+        if c.ticker:
+            all_cand_tickers.add(c.ticker)
+    log.info(
+        "Live %s screen: fresh_10k=%d -> fundamental_qualifiers=%d",
+        SAMPLE_END,
+        live_fund_audit["total_10k_asof_fresh"],
+        live_fund_audit["fundamental_qualifiers"],
+    )
+
     # 3. Batch-load yfinance bars for all fundamental qualifiers (reusing existing cache!)
     log.info("Step 3/6: Loading/caching yfinance bars for %d unique fundamental qualifier tickers...", len(all_cand_tickers))
     bars_map, fetch_statuses = batch_load_yfinance_bars(
@@ -480,6 +495,35 @@ def main() -> None:
         "OOS": _agg_surv(OOS_VINTAGES),
         "ALL": _agg_surv(tuple(rebalance_dates.keys())),
     }
+
+    live_eval, live_surv = evaluate_vintage_candidates(live_cands, bars_map, ticker_meta, spy_bars, cfg_base)
+    # A snapshot on the last sample bar has no "next open". Names that pass
+    # price, market cap, and ADV are qualifiers even when the entry bar is absent.
+    live_top = [
+        e for e in live_eval
+        if e.status in ("qualified_matched", "rejected_no_entry_bar")
+    ][:15]
+    live_rows: list[dict[str, Any]] = []
+    for e in live_top:
+        c = e.candidate
+        live_rows.append({
+            "ticker": c.ticker,
+            "company_name": c.name,
+            "sic": c.sic,
+            "filing_date": c.filed_date.isoformat(),
+            "pit_market_cap_usd": None if e.pit_market_cap_usd is None else round(e.pit_market_cap_usd, 2),
+            "revenue_trend_2y": (
+                f"{c.revenue_t2_usd / 1e6:.1f}→{c.revenue_prior_usd / 1e6:.1f}→{c.revenue_usd / 1e6:.1f}"
+            ),
+            "operating_margin_pct": round(c.operating_margin * 100.0, 2),
+            "fcf_margin_pct": round(c.fcf_margin * 100.0, 2),
+            "debt_to_equity": round(c.debt_to_equity, 4),
+            "yoy_dilution_pct": round(c.yoy_share_dilution * 100.0, 2),
+            "rule_of_40_capped": round(c.rule_of_40, 2),
+        })
+    live_csv = outputs_dir / "v10_live_2026_candidates.csv"
+    pd.DataFrame(live_rows).to_csv(live_csv, index=False)
+    log.info("Live late-2026 top-%d written to %s", len(live_rows), live_csv)
 
     # 5. Part A — Qualifying Pool Event Study + Top-5 Tables
     log.info("Step 5/6: Running Part A Event Study (1Y/2Y/3Y vs SPY, Multi-Baggers, Blow-Ups)...")
@@ -555,11 +599,42 @@ def main() -> None:
     part_b: dict[str, Any] = {}
     full_results: dict[tuple[str, str, bool], CoffeeCanPortfolioResult] = {}
 
+    replacement_cache: dict[tuple[date, bool], list[Any]] = {}
+
+    def _replacement_screen(decision: date, *, penalized: bool) -> list[Any]:
+        key = (decision, penalized)
+        cached = replacement_cache.get(key)
+        if cached is not None:
+            return cached
+        pre, _ = screen_fundamentals_asof(
+            annual_df, decision, cfg_base, vintage_label=f"redeploy-{decision.isoformat()}"
+        )
+        missing = sorted({c.ticker for c in pre if c.ticker and c.ticker not in bars_map})
+        if missing:
+            loaded, _ = batch_load_yfinance_bars(
+                missing, cache_root=cache_root, start=BAR_FETCH_START, end=BAR_FETCH_END
+            )
+            bars_map.update(loaded)
+        ranked = screen_replacement_candidates(
+            annual_df,
+            decision,
+            bars_map,
+            ticker_meta,
+            spy_bars,
+            cfg_base,
+            survivorship_penalized=penalized,
+        )
+        replacement_cache[key] = ranked
+        return ranked
+
     for rule_name in ("v10a_annual_top5", "v10b_coffee_can_thesis_watch"):
         cfg_r = CoffeeCanConfig(rule=rule_name)  # type: ignore[arg-type]
         part_b[rule_name] = {}
         for mode_label, is_pen in (("raw_matched", False), ("survivorship_penalized", True)):
             part_b[rule_name][mode_label] = {}
+            screen_fn = None
+            if rule_name == "v10b_coffee_can_thesis_watch":
+                screen_fn = lambda d, _pen=is_pen: _replacement_screen(d, penalized=_pen)
             for wname, (ws, we) in bt_windows.items():
                 part_b[rule_name][mode_label][wname] = {}
                 for cap_key, cap_eur, cap_usd in CAPITALS:
@@ -576,6 +651,7 @@ def main() -> None:
                         initial_capital_eur=cap_eur,
                         window_label=wname,
                         survivorship_penalized=is_pen,
+                        replacement_screen=screen_fn,
                     )
                     m = compute_coffee_can_metrics(
                         res,
@@ -631,6 +707,12 @@ def main() -> None:
         "survivorship_by_vintage": surv_by_vintage,
         "survivorship_summary": surv_summary,
         "part_a_event_study": part_a,
+        "live_2026_11_20": {
+            "fundamental_audit": live_fund_audit,
+            "survivorship": live_surv,
+            "top15": live_rows,
+            "csv": str(live_csv),
+        },
         "benchmarks": benchmarks,
         "part_b_portfolio": part_b,
         "media_paths": media_paths,

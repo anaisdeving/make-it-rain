@@ -39,6 +39,7 @@ from src.strategy.coffee_can_screener import (
     run_coffee_can_event_study,
     run_coffee_can_portfolio_backtest,
     screen_fundamentals_asof,
+    screen_replacement_candidates,
 )
 
 
@@ -85,15 +86,25 @@ def _make_annual_row(
     period_date: str = "2021-12-31",
     revenue: float = 200e6,
     revenue_prior: float = 120e6,
+    revenue_t2: float | None = None,
     gross_profit: float = 150e6,
+    operating_income: float | None = None,
     ocf: float = 50e6,
     capex: float = 10e6,
+    capex_reported: bool | None = None,
     cash_total: float = 120e6,
     total_debt: float = 20e6,
     equity: float = 150e6,
     shares_curr: float = 50e6,
     shares_prior: float = 49e6,
 ) -> dict:
+    t2_val = (revenue_prior * 0.75) if revenue_t2 is None else revenue_t2
+    opinc_val = (0.20 * revenue) if operating_income is None else operating_income
+    capex_missing = capex is None or (isinstance(capex, float) and pd.isna(capex))
+    if capex_reported is False:
+        capex_missing = True
+    reported = not capex_missing
+    fcf_val = (ocf - capex) if reported else np.nan
     return {
         "adsh": adsh,
         "quarter": "2022q1",
@@ -108,12 +119,14 @@ def _make_annual_row(
         "rev_tag": "Revenues",
         "revenue": revenue,
         "revenue_prior_in_filing": revenue_prior,
+        "revenue_t2_in_filing": t2_val,
         "gp_tag": "GrossProfit",
         "gross_profit": gross_profit,
+        "operating_income": opinc_val,
         "ocf": ocf,
-        "capex": capex,
-        "capex_reported": True,
-        "fcf": ocf - capex,
+        "capex": capex if reported else np.nan,
+        "capex_reported": reported,
+        "fcf": fcf_val,
         "cash_total": cash_total,
         "total_debt": total_debt,
         "stockholders_equity": equity,
@@ -435,3 +448,222 @@ def test_survivorship_penalized_part_a_and_part_b() -> None:
     res_pen = run_coffee_can_portfolio_backtest({"2022-04": ev}, {"2022-04": reb22}, {"LIVE": bar_ok}, spy, {}, cfg, reb22, date(2023, 6, 1), 5300.0, 5000.0, survivorship_penalized=True)
     assert any(t.exit_reason == "UNMATCHED_PENALIZED_50" for t in res_pen.trades)
     assert res_pen.equity_curve["equity"].iloc[-1] < res_raw.equity_curve["equity"].iloc[-1]
+
+
+# ---------------------------------------------------------------------------
+# 7. Hygiene: tiny base / one-year spikes, extractive margins, Rule-of-40 caps
+# ---------------------------------------------------------------------------
+def test_reject_tiny_prior_revenue_and_single_year_spikes() -> None:
+    reb = date(2023, 4, 3)
+    raw = pd.DataFrame([
+        # Prior-year revenue $40M < $50M (launch base). Current year is large.
+        _make_annual_row(cik="0001", ticker="TINY", adsh="T1", filed_date="2023-02-20", revenue=200e6, revenue_prior=40e6, revenue_t2=10e6),
+        # Both years clear $50M, but Rev_t-1 ($80M) is not above Rev_t-2 ($90M).
+        _make_annual_row(cik="0002", ticker="SPIKE", adsh="S1", filed_date="2023-02-20", revenue=200e6, revenue_prior=80e6, revenue_t2=90e6),
+        # Two consecutive growing years, both bases >= $50M.
+        _make_annual_row(cik="0003", ticker="STEADY", adsh="G1", filed_date="2023-02-20", revenue=200e6, revenue_prior=120e6, revenue_t2=80e6),
+        # t-2 omitted on the current 10-K; the prior 10-K's comparative supplies it.
+        _make_annual_row(
+            cik="0004", ticker="FALL", adsh="F-NEW", filed_date="2023-02-20", period_date="2022-12-31",
+            revenue=180e6, revenue_prior=110e6, revenue_t2=np.nan,
+        ),
+        _make_annual_row(
+            cik="0004", ticker="FALL", adsh="F-OLD", filed_date="2022-02-20", period_date="2021-12-31",
+            revenue=110e6, revenue_prior=70e6, revenue_t2=40e6,
+        ),
+    ])
+    cands, counts = screen_fundamentals_asof(enrich_annual_comparatives(raw), reb, CoffeeCanConfig())
+    tickers = [c.ticker for c in cands]
+    assert "TINY" not in tickers
+    assert "SPIKE" not in tickers
+    assert "STEADY" in tickers
+    assert "FALL" in tickers
+    fall = next(c for c in cands if c.ticker == "FALL")
+    assert fall.revenue_t2_usd == pytest.approx(70e6)
+    assert fall.revenue_prior_usd > fall.revenue_t2_usd
+    assert counts["excluded_revenue_lt_50m"] >= 1
+    assert counts["excluded_single_year_revenue_spike"] >= 1
+
+
+def test_reject_extractive_sic_weak_operating_margin_fcf_above_sales_and_missing_capex() -> None:
+    # Loader: missing capex stays NaN, a reported zero stays zero, an alternate tag is used.
+    sub = pd.DataFrame([
+        {"adsh": "B1", "cik": "2001", "name": "No Capex Co", "sic": "7372", "form": "10-K", "period": "20231231", "fp": "FY", "filed": "20240220", "instance": "ncap-20231231_htm.xml"},
+        {"adsh": "B2", "cik": "2002", "name": "Zero Capex Co", "sic": "7372", "form": "10-K", "period": "20231231", "fp": "FY", "filed": "20240220", "instance": "zcap-20231231_htm.xml"},
+        {"adsh": "B3", "cik": "2003", "name": "Alt Capex Co", "sic": "7372", "form": "10-K", "period": "20231231", "fp": "FY", "filed": "20240220", "instance": "acap-20231231_htm.xml"},
+        {"adsh": "B4", "cik": "2004", "name": "Opex Fallback Co", "sic": "7372", "form": "10-K", "period": "20231231", "fp": "FY", "filed": "20240220", "instance": "opex-20231231_htm.xml"},
+    ])
+
+    def _fact(adsh: str, tag: str, ddate: str, qtrs: str, value: str, uom: str = "USD") -> dict:
+        return {"adsh": adsh, "tag": tag, "version": "us-gaap/2023", "ddate": ddate, "qtrs": qtrs, "uom": uom, "coreg": np.nan, "value": value}
+
+    num = pd.DataFrame([
+        _fact("B1", "Revenues", "20231231", "4", "100000000"),
+        _fact("B1", "Revenues", "20221231", "4", "80000000"),
+        _fact("B1", "NetCashProvidedByUsedInOperatingActivities", "20231231", "4", "20000000"),
+        _fact("B2", "Revenues", "20231231", "4", "100000000"),
+        _fact("B2", "NetCashProvidedByUsedInOperatingActivities", "20231231", "4", "20000000"),
+        _fact("B2", "PaymentsToAcquirePropertyPlantAndEquipment", "20231231", "4", "0"),
+        _fact("B3", "Revenues", "20231231", "4", "100000000"),
+        _fact("B3", "NetCashProvidedByUsedInOperatingActivities", "20231231", "4", "20000000"),
+        _fact("B3", "PaymentsToAcquireProductiveAssets", "20231231", "4", "-4000000"),
+        _fact("B4", "Revenues", "20231231", "4", "100000000"),
+        _fact("B4", "OperatingExpenses", "20231231", "4", "70000000"),
+        _fact("B4", "NetCashProvidedByUsedInOperatingActivities", "20231231", "4", "20000000"),
+        _fact("B4", "PaymentsToAcquirePropertyPlantAndEquipment", "20231231", "4", "-5000000"),
+        _fact("B1", "OperatingIncomeLoss", "20231231", "4", "30000000"),
+    ])
+    parsed, _, _ = parse_xbrl_quarter_frames(sub, num, {}, quarter="2024q1")
+    enriched = enrich_annual_comparatives(parsed).set_index("adsh")
+    assert pd.isna(enriched.loc["B1", "capex"])
+    assert bool(enriched.loc["B1", "capex_reported"]) is False
+    assert pd.isna(enriched.loc["B1", "fcf"])
+    assert enriched.loc["B1", "fcf"] != pytest.approx(20e6)
+    assert enriched.loc["B2", "capex"] == pytest.approx(0.0)
+    assert enriched.loc["B2", "fcf"] == pytest.approx(20e6)
+    assert enriched.loc["B3", "capex"] == pytest.approx(4e6)
+    assert enriched.loc["B3", "fcf"] == pytest.approx(16e6)
+    assert enriched.loc["B1", "operating_income"] == pytest.approx(30e6)
+    assert enriched.loc["B4", "operating_income"] == pytest.approx(30e6)  # 100 - 70
+
+    reb = date(2023, 4, 3)
+    raw = pd.DataFrame([
+        _make_annual_row(cik="3001", ticker="OIL", sic=1311, adsh="O1", filed_date="2023-02-20"),
+        _make_annual_row(cik="3002", ticker="COAL", sic=1221, adsh="C1", filed_date="2023-02-20"),
+        _make_annual_row(cik="3003", ticker="THIN", adsh="M1", filed_date="2023-02-20", operating_income=8e6),  # 8/200 = 4%
+        _make_annual_row(cik="3004", ticker="WIND", adsh="W1", filed_date="2023-02-20", ocf=260e6, capex=10e6),  # FCF 250 > revenue 200
+        _make_annual_row(cik="3005", ticker="NOCAP", adsh="N1", filed_date="2023-02-20", capex=np.nan, capex_reported=False),
+        _make_annual_row(cik="3006", ticker="KEEP", adsh="K1", filed_date="2023-02-20"),
+    ])
+    cands, counts = screen_fundamentals_asof(enrich_annual_comparatives(raw), reb, CoffeeCanConfig())
+    tickers = [c.ticker for c in cands]
+    assert tickers == ["KEEP"]
+    assert counts["excluded_sic_extractive"] == 2
+    assert counts["excluded_operating_margin_lt_10pct"] == 1
+    assert counts["excluded_fcf_gt_revenue"] == 1
+    assert counts["excluded_missing_capex"] == 1
+    nocap = enrich_annual_comparatives(raw)
+    nocap_row = nocap[nocap["ticker"] == "NOCAP"].iloc[0]
+    assert pd.isna(nocap_row["fcf"])
+    assert nocap_row["fcf"] != pytest.approx(float(nocap_row["ocf"]))
+
+
+def test_rule_of_40_caps_growth_at_100_and_fcf_margin_at_50() -> None:
+    reb = date(2023, 4, 3)
+    # YoY = 200/80 - 1 = 150%, FCF margin = 160/200 = 80%. Uncapped score would be 230.
+    raw = pd.DataFrame([
+        _make_annual_row(
+            cik="4001", ticker="HOT", adsh="H1", filed_date="2023-02-20",
+            revenue=200e6, revenue_prior=80e6, revenue_t2=50e6,
+            ocf=170e6, capex=10e6,
+        ),
+    ])
+    enriched = enrich_annual_comparatives(raw)
+    row = enriched.iloc[0]
+    assert row["yoy_rev_growth"] == pytest.approx(1.50)
+    assert row["fcf_margin"] == pytest.approx(0.80)
+    assert row["rule_of_40"] == pytest.approx(150.0)
+
+    cands, _ = screen_fundamentals_asof(enriched, reb, CoffeeCanConfig())
+    assert len(cands) == 1
+    assert cands[0].yoy_rev_growth == pytest.approx(1.50)
+    assert cands[0].fcf_margin == pytest.approx(0.80)
+    assert cands[0].rule_of_40 == pytest.approx(150.0)
+    assert cands[0].rule_of_40 == pytest.approx(100.0 + 50.0)
+
+
+def test_v10b_ttm_runway_redeploys_without_lookahead() -> None:
+    spy = _make_spy("2021-10-01", "2022-09-30")
+    idx = spy.frame.index
+    reb22 = first_trading_day_of_april(idx, 2022)
+    flat = np.full(len(idx), 20.0)
+    bars = {
+        "HELD": _make_bars("HELD", idx, opens=flat, closes=flat),
+        "ONLY": _make_bars("ONLY", idx, opens=flat, closes=flat),
+        "REPL": _make_bars("REPL", idx, opens=flat, closes=flat),
+        "FUTR": _make_bars("FUTR", idx, opens=flat, closes=flat),
+    }
+    raw = pd.DataFrame([
+        _make_annual_row(cik="0001", ticker="HELD", adsh="K-HELD", filed_date="2022-02-28", period_date="2021-12-31", ocf=50e6, capex=10e6),
+        _make_annual_row(cik="0002", ticker="ONLY", adsh="K-ONLY", filed_date="2022-02-28", period_date="2021-12-31", ocf=50e6, capex=10e6),
+        _make_annual_row(
+            cik="0003", ticker="REPL", adsh="K-REPL", filed_date="2022-06-15", period_date="2022-03-31",
+            revenue=180e6, revenue_prior=100e6, revenue_t2=70e6,
+        ),
+        # Filed on the exit morning. Visible only if the rank peeks past the decision date.
+        _make_annual_row(
+            cik="0004", ticker="FUTR", adsh="K-FUTR", filed_date="2022-08-08", period_date="2022-06-30",
+            revenue=300e6, revenue_prior=100e6, revenue_t2=60e6, ocf=80e6, capex=10e6,
+        ),
+    ])
+    annual = enrich_annual_comparatives(raw)
+    cfg = CoffeeCanConfig(rule="v10b_coffee_can_thesis_watch")
+    cands, _ = screen_fundamentals_asof(annual, reb22, cfg, vintage_label="2022-04")
+    assert sorted(c.ticker for c in cands) == ["HELD", "ONLY"]
+    ev, _ = evaluate_vintage_candidates(cands, bars, {}, spy, cfg)
+
+    def _q(adsh: str, cik: str, filed: str, period: str, fp: str, ytd: float, qtrs: int, cash: float) -> dict:
+        return {
+            "adsh": adsh,
+            "cik": cik,
+            "filed_date": pd.Timestamp(filed),
+            "period_date": pd.Timestamp(period),
+            "fp": fp,
+            "yoy_rev_growth": 0.30,
+            "cash_total": cash,
+            "ytd_fcf": ytd,
+            "ytd_qtrs": qtrs,
+            "q_fcf": np.nan,
+        }
+
+    quarterly = pd.DataFrame([
+        _q("Q1A", "0001", "2021-05-10", "2021-03-31", "Q1", 10e6, 1, 40e6),
+        _q("Q2A", "0001", "2021-08-10", "2021-06-30", "Q2", 20e6, 2, 40e6),
+        _q("Q3A", "0001", "2021-11-10", "2021-09-30", "Q3", 30e6, 3, 40e6),
+        _q("Q1B", "0001", "2022-05-10", "2022-03-31", "Q1", -5e6, 1, 20e6),
+        _q("Q2B", "0001", "2022-08-05", "2022-06-30", "Q2", -45e6, 2, 10e6),
+        # One ugly quarter. Annualizing it would fake a sub-12-month runway.
+        _q("Q1C", "0002", "2022-05-10", "2022-03-31", "Q1", -40e6, 1, 10e6),
+    ])
+    thesis = build_thesis_watch_events(annual, quarterly)
+    held_q = {e["adsh"]: e for e in thesis["0001"] if e["form"] == "10-Q"}
+    assert held_q["Q1B"]["runway_source"] == "ttm_4q"
+    assert held_q["Q1B"]["ttm_fcf"] == pytest.approx(25e6)
+    assert held_q["Q1B"]["cash_runway_months"] == float("inf")
+    assert held_q["Q2B"]["runway_source"] == "ttm_4q"
+    assert held_q["Q2B"]["ttm_fcf"] == pytest.approx(-25e6)
+    assert held_q["Q2B"]["cash_runway_months"] == pytest.approx(4.8)
+    only_q = next(e for e in thesis["0002"] if e["form"] == "10-Q")
+    assert only_q["runway_source"] == "annual_10k"
+    assert only_q["cash_runway_months"] == float("inf")
+    assert only_q["ttm_fcf"] == pytest.approx(40e6)
+
+    seen: list[date] = []
+
+    def _screen(decision: date):
+        seen.append(decision)
+        return screen_replacement_candidates(annual, decision, bars, {}, spy, cfg)
+
+    res = run_coffee_can_portfolio_backtest(
+        {"2022-04": ev},
+        {"2022-04": reb22},
+        bars,
+        spy,
+        thesis,
+        cfg,
+        reb22,
+        date(2022, 9, 30),
+        5300.0,
+        5000.0,
+        replacement_screen=_screen,
+    )
+    closed = {t.ticker: t for t in res.trades}
+    opened = {t.ticker: t for t in res.open_positions_at_end}
+    assert closed["HELD"].exit_reason == "THESIS_BREAK_RUNWAY"
+    assert closed["HELD"].exit_date == date(2022, 8, 8)
+    assert "ONLY" not in closed
+    assert opened["ONLY"].exit_reason == "OPEN_MTM"
+    assert opened["REPL"].entry_date == date(2022, 8, 8)
+    assert "FUTR" not in closed and "FUTR" not in opened
+    assert seen == [date(2022, 8, 5)]
+    assert all(d <= date(2022, 8, 5) for d in seen)

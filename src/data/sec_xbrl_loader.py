@@ -12,12 +12,16 @@ Strict anti-bias & XBRL data-integrity guarantees:
 - Extracts **strictly consolidated** facts (``coreg`` empty AND ``segments`` empty
   where present), strictly ``uom == "USD"`` for monetary tags and ``uom == "shares"``
   for share counts.
-- Pulls current-year AND prior-year comparative ``qtrs == 4`` values directly from
-  each ``10-K`` (falling back to the prior ``10-K`` for the same ``cik`` when absent)
-  so YoY revenue growth and YoY share dilution remain split-consistent and
-  strictly point-in-time as of ``sub.txt`` ``filed``.
+- Pulls current-year, prior-year, and two-years-prior comparative ``qtrs == 4``
+  revenue directly from each ``10-K`` (falling back to an earlier ``10-K`` of the
+  same ``cik`` filed strictly earlier) so two-year revenue growth and YoY share
+  dilution remain split-consistent and point-in-time as of ``sub.txt`` ``filed``.
+- Extracts ``OperatingIncomeLoss`` (fallback ``Revenue - OperatingExpenses``).
+- Free cash flow subtracts a reported capex tag. If every capex tag is missing,
+  capex and FCF stay NaN. Missing capex is never coerced to 0.
 - Extracts quarterly ``10-Q`` comparative ``qtrs == 1`` YoY revenue growth and
-  YTD-annualized FCF / cash runway for causal thesis-break monitoring.
+  standalone / YTD cash-flow components. Trailing-twelve-month runway is computed
+  later by the screener; a single quarter is never annualized into runway.
 - Maps ``cik -> historical ticker`` via ``sub.txt`` ``instance`` prefix
   cross-checked against ``https://www.sec.gov/files/company_tickers.json``,
   logging exact resolution sources and unresolved mappings.
@@ -72,7 +76,15 @@ REVENUE_TAGS: tuple[str, ...] = (
 GROSS_PROFIT_TAGS: tuple[str, ...] = ("GrossProfit",)
 COGS_TAGS: tuple[str, ...] = ("CostOfGoodsAndServicesSold", "CostOfRevenue")
 OCF_TAGS: tuple[str, ...] = ("NetCashProvidedByUsedInOperatingActivities",)
-CAPEX_TAGS: tuple[str, ...] = ("PaymentsToAcquirePropertyPlantAndEquipment",)
+# First tag that is actually reported wins. Missing (all NaN) is not zero.
+CAPEX_TAGS: tuple[str, ...] = (
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+    "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
+    "CapitalExpendituresIncurredButNotYetPaid",
+)
+OPINC_TAGS: tuple[str, ...] = ("OperatingIncomeLoss",)
+OPEX_TAGS: tuple[str, ...] = ("OperatingExpenses",)
 CASH_TAGS: tuple[str, ...] = ("CashAndCashEquivalentsAtCarryingValue",)
 STI_TAGS: tuple[str, ...] = ("ShortTermInvestments", "MarketableSecuritiesCurrent")
 DEBT_NONCURR_TAGS: tuple[str, ...] = ("LongTermDebtNoncurrent",)
@@ -91,6 +103,8 @@ ALL_TARGET_TAGS: frozenset[str] = frozenset(
     + COGS_TAGS
     + OCF_TAGS
     + CAPEX_TAGS
+    + OPINC_TAGS
+    + OPEX_TAGS
     + CASH_TAGS
     + STI_TAGS
     + DEBT_NONCURR_TAGS
@@ -100,6 +114,13 @@ ALL_TARGET_TAGS: frozenset[str] = frozenset(
     + SHARES_BS_TAGS
     + SHARES_DILUTED_TAGS
 )
+
+# Bump when parsed parquet columns change so load_quarters reparses local ZIPs.
+PARSER_VERSION = "v10_coffee_can_clean_1"
+
+# Winsor caps applied to Rule-of-40 inputs (decimal, not percent points).
+RULE40_MAX_YOY = 1.0
+RULE40_MAX_FCF_MARGIN = 0.50
 
 SHARES_TAGS_SET: frozenset[str] = frozenset(SHARES_BS_TAGS + SHARES_DILUTED_TAGS)
 
@@ -282,6 +303,73 @@ def _pick_chain_single(
     return None, None, None
 
 
+def _select_two_year_prior_fact(
+    facts: list[tuple[pd.Timestamp, float]],
+    curr_ddate: pd.Timestamp,
+    min_days: int = 650,
+    max_days: int = 800,
+) -> tuple[pd.Timestamp | None, float | None]:
+    """Pick the comparative fact about two fiscal years before ``curr_ddate``."""
+    best_dt: pd.Timestamp | None = None
+    best_val: float | None = None
+    best_dist = 10_000
+    for dt, val in facts:
+        if pd.isna(dt) or math.isnan(val):
+            continue
+        delta = (curr_ddate - dt).days
+        if min_days <= delta <= max_days:
+            dist = abs(delta - 730)
+            if dist < best_dist:
+                best_dist = dist
+                best_dt = dt
+                best_val = val
+    return best_dt, best_val
+
+
+def _pick_revenue_history(
+    tag_map: dict[tuple[str, int], list[tuple[pd.Timestamp, float]]],
+    tags: tuple[str, ...],
+    qtrs: int,
+    period_ts: pd.Timestamp,
+) -> tuple[str | None, pd.Timestamp | None, float | None, float | None, float | None]:
+    """Return ``(tag, curr_ddate, rev_t, rev_t1, rev_t2)`` from one revenue tag."""
+    for tag in tags:
+        entries = tag_map.get((tag, qtrs))
+        if not entries:
+            continue
+        c_dt, c_val = _select_fact_by_ddate(entries, period_ts, max_day_diff=45)
+        if c_dt is not None and c_val is not None:
+            _, p_val = _select_prior_year_fact(entries, c_dt)
+            _, t2_val = _select_two_year_prior_fact(entries, c_dt)
+            return tag, c_dt, c_val, p_val, t2_val
+    return None, None, None, None, None
+
+
+def _pick_reported_capex(
+    tag_map: dict[tuple[str, int], list[tuple[pd.Timestamp, float]]],
+    qtrs: int,
+    period_ts: pd.Timestamp,
+) -> tuple[str | None, float | None]:
+    """Return ``(tag, abs(capex))`` for the first reported capex tag.
+
+    A reported zero stays zero. If every capex tag is missing, return
+    ``(None, None)`` — callers must not substitute 0.
+    """
+    tag, _, val = _pick_chain_single(tag_map, CAPEX_TAGS, qtrs, period_ts)
+    if tag is None or val is None or math.isnan(float(val)):
+        return None, None
+    return tag, abs(float(val))
+
+
+def _fcf_from_ocf_and_capex(ocf_val: float | None, capex_abs: float | None) -> float | None:
+    """Operating cash flow minus reported capex. Missing capex → missing FCF."""
+    if ocf_val is None or capex_abs is None:
+        return None
+    if math.isnan(ocf_val) or math.isnan(capex_abs):
+        return None
+    return float(ocf_val) - float(capex_abs)
+
+
 def _is_empty_str_series(series: pd.Series) -> pd.Series:
     return series.isna() | (series.astype(str).str.strip() == "") | (series.astype(str).str.lower() == "nan")
 
@@ -383,8 +471,8 @@ def parse_xbrl_quarter_frames(
         fp = str(getattr(row, "fp", "") or "").strip().upper()
 
         if form == "10-K":
-            # 1. Revenue (qtrs == 4) + comparative prior-year from same 10-K
-            rev_tag, rev_dt, rev_curr, rev_prior = _pick_chain_current_and_prior(
+            # 1. Revenue (qtrs == 4) + comparative prior year and two-years-prior
+            rev_tag, rev_dt, rev_curr, rev_prior, rev_t2 = _pick_revenue_history(
                 tmap, REVENUE_TAGS, 4, period_ts
             )
             anchor_dt = rev_dt if rev_dt is not None else period_ts
@@ -397,11 +485,19 @@ def parse_xbrl_quarter_frames(
                     gp_val = rev_curr - abs(cogs_val)
                     gp_tag = f"computed_from_{cogs_tag}"
 
-            # 3. OCF & CapEx -> FCF (qtrs == 4)
+            # 2b. Operating income (direct tag, else Revenue - OperatingExpenses)
+            opinc_tag, _, opinc_val = _pick_chain_single(tmap, OPINC_TAGS, 4, anchor_dt)
+            if opinc_val is None and rev_curr is not None:
+                opex_tag, _, opex_val = _pick_chain_single(tmap, OPEX_TAGS, 4, anchor_dt)
+                if opex_val is not None:
+                    opinc_val = rev_curr - float(opex_val)
+                    opinc_tag = f"computed_from_{opex_tag}"
+
+            # 3. OCF & CapEx -> FCF (qtrs == 4). Missing capex stays missing.
             _, _, ocf_val = _pick_chain_single(tmap, OCF_TAGS, 4, anchor_dt)
-            _, _, capex_val = _pick_chain_single(tmap, CAPEX_TAGS, 4, anchor_dt)
-            capex_reported = capex_val is not None
-            fcf_val = (ocf_val - abs(capex_val if capex_val is not None else 0.0)) if ocf_val is not None else None
+            capex_tag, capex_abs = _pick_reported_capex(tmap, 4, anchor_dt)
+            capex_reported = capex_abs is not None
+            fcf_val = _fcf_from_ocf_and_capex(ocf_val, capex_abs)
 
             # 4. Cash + optional ShortTermInvestments / MarketableSecuritiesCurrent (qtrs == 0)
             _, _, cash_val = _pick_chain_single(tmap, CASH_TAGS, 0, anchor_dt)
@@ -472,12 +568,16 @@ def parse_xbrl_quarter_frames(
                 "rev_tag": rev_tag or "",
                 "revenue": rev_curr,
                 "revenue_prior_in_filing": rev_prior,
+                "revenue_t2_in_filing": rev_t2,
                 "gp_tag": gp_tag or "",
                 "gross_profit": gp_val,
+                "opinc_tag": opinc_tag or "",
+                "operating_income": opinc_val,
                 "ocf": ocf_val,
-                "capex": abs(capex_val) if capex_val is not None else np.nan,
+                "capex_tag": capex_tag or "",
+                "capex": capex_abs if capex_abs is not None else np.nan,
                 "capex_reported": capex_reported,
-                "fcf": fcf_val,
+                "fcf": fcf_val if fcf_val is not None else np.nan,
                 "cash_total": cash_total,
                 "total_debt": total_debt,
                 "stockholders_equity": eq_val,
@@ -503,32 +603,29 @@ def parse_xbrl_quarter_frames(
                 else (max(0.0, sti_val) if sti_val is not None else None)
             )
 
-            # 10-Q cash flow is YTD (qtrs == 1 in Q1, 2 in Q2, 3 in Q3)
+            # Standalone quarter (qtrs == 1) only when BOTH OCF and capex are reported.
+            _, _, q_ocf = _pick_chain_single(tmap, OCF_TAGS, 1, anchor_dt)
+            _, q_capex_abs = _pick_reported_capex(tmap, 1, anchor_dt)
+            q_fcf = _fcf_from_ocf_and_capex(q_ocf, q_capex_abs)
+
+            # YTD cash flow (qtrs == 1 in Q1, 2 in Q2, 3 in Q3). Capex is not zero-filled.
             preferred_q = {"Q1": (1,), "Q2": (2, 1), "Q3": (3, 1, 2)}.get(fp, (3, 2, 1))
             ytd_ocf, ytd_capex, ytd_qtrs = None, None, None
             for qk in preferred_q:
                 _, _, o_v = _pick_chain_single(tmap, OCF_TAGS, qk, anchor_dt)
-                if o_v is not None:
-                    ytd_ocf = o_v
-                    ytd_qtrs = qk
-                    _, _, c_v = _pick_chain_single(tmap, CAPEX_TAGS, qk, anchor_dt)
-                    ytd_capex = abs(c_v) if c_v is not None else 0.0
-                    break
+                if o_v is None:
+                    continue
+                _, c_abs = _pick_reported_capex(tmap, qk, anchor_dt)
+                ytd_ocf = o_v
+                ytd_qtrs = qk
+                ytd_capex = c_abs  # None when every capex tag is missing
+                break
 
-            ann_fcf = (
-                (ytd_ocf - (ytd_capex or 0.0)) * (4.0 / float(ytd_qtrs))
-                if (ytd_ocf is not None and ytd_qtrs)
-                else None
-            )
+            ytd_fcf = _fcf_from_ocf_and_capex(ytd_ocf, ytd_capex)
             q_yoy_rev = (
                 (rev_q_curr / rev_q_prior - 1.0)
                 if (rev_q_curr is not None and rev_q_prior is not None and rev_q_prior > 0)
                 else None
-            )
-            runway_m = (
-                (cash_total / abs(ann_fcf)) * 12.0
-                if (ann_fcf is not None and ann_fcf < 0 and cash_total is not None)
-                else (float("inf") if (ann_fcf is not None and ann_fcf >= 0) else None)
             )
 
             quarterly_rows.append({
@@ -546,8 +643,11 @@ def parse_xbrl_quarter_frames(
                 "rev_q_prior": rev_q_prior,
                 "yoy_rev_growth": q_yoy_rev,
                 "cash_total": cash_total,
-                "annualized_fcf": ann_fcf,
-                "cash_runway_months": runway_m,
+                "q_fcf": q_fcf if q_fcf is not None else np.nan,
+                "ytd_ocf": ytd_ocf if ytd_ocf is not None else np.nan,
+                "ytd_capex": ytd_capex if ytd_capex is not None else np.nan,
+                "ytd_qtrs": ytd_qtrs if ytd_qtrs is not None else np.nan,
+                "ytd_fcf": ytd_fcf if ytd_fcf is not None else np.nan,
             })
 
     audit["ticker_resolution_counts"] = res_counts
@@ -557,10 +657,12 @@ def parse_xbrl_quarter_frames(
 
 
 def enrich_annual_comparatives(annual_df: pd.DataFrame) -> pd.DataFrame:
-    """Fill missing prior-year revenue/shares strictly causally from earlier 10-K of same ``cik``.
+    """Fill missing prior-year and two-year revenue strictly causally.
 
-    Only uses earlier 10-K filings with ``prior.filed_date < curr.filed_date`` and
-    ``300 <= (curr.period_date - prior.period_date).days <= 430``. Zero look-ahead!
+    Comparatives come from the filing itself, else from an earlier 10-K of the
+    same ``cik`` with ``prior.filed_date < curr.filed_date``. One-year lookback
+    uses a period gap of 300–430 days; two-year lookback uses 650–800 days.
+    Missing capex is never treated as zero: FCF stays NaN. Zero look-ahead.
     """
     if annual_df.empty:
         return annual_df.copy()
@@ -574,7 +676,23 @@ def enrich_annual_comparatives(annual_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    rev_prior_final = df["revenue_prior_in_filing"].to_numpy(dtype=float, copy=True)
+    if "revenue_t2_in_filing" not in df.columns:
+        df["revenue_t2_in_filing"] = np.nan
+    if "operating_income" not in df.columns:
+        df["operating_income"] = np.nan
+    if "capex_reported" not in df.columns:
+        df["capex_reported"] = df["capex"].notna() if "capex" in df.columns else False
+    reported = pd.Series(
+        [(bool(v) if pd.notna(v) else False) for v in df["capex_reported"].tolist()],
+        index=df.index,
+        dtype=bool,
+    )
+    df.loc[~reported, "fcf"] = np.nan
+    if "capex" in df.columns:
+        df.loc[~reported, "capex"] = np.nan
+
+    rev_prior_final = pd.to_numeric(df["revenue_prior_in_filing"], errors="coerce").to_numpy(dtype=float, copy=True)
+    rev_t2_final = pd.to_numeric(df["revenue_t2_in_filing"], errors="coerce").to_numpy(dtype=float, copy=True)
     sh_curr_final = df["shares_comp_curr"].to_numpy(dtype=float, copy=True)
     sh_prior_final = df["shares_comp_prior_in_filing"].to_numpy(dtype=float, copy=True)
 
@@ -628,19 +746,71 @@ def enrich_annual_comparatives(annual_df: pd.DataFrame) -> pd.DataFrame:
                         sh_curr_final[cur_i] = float(cur_sh)
                         sh_prior_final[cur_i] = float(prev_sh)
 
+    # Two-years-prior revenue: in-filing comparative, else the prior 10-K's
+    # comparative (Rev_t-2), else the 10-K filed ~2 years earlier. All strictly
+    # earlier filings (filed_date < current).
+    def _earlier_filing(pos_list: list[Any], k: int, min_days: int, max_days: int, target_gap: int) -> Any:
+        cur_i = pos_list[k]
+        cur_filed = df.at[cur_i, "filed_date"]
+        cur_period = df.at[cur_i, "period_date"]
+        best_prev = None
+        best_dist = 10_000
+        for j in range(k - 1, -1, -1):
+            prev_i = pos_list[j]
+            if df.at[prev_i, "filed_date"] >= cur_filed:
+                continue
+            delta = (cur_period - df.at[prev_i, "period_date"]).days
+            if min_days <= delta <= max_days:
+                dist = abs(delta - target_gap)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_prev = prev_i
+        return best_prev
+
+    for _cik, idxs in df.groupby("cik", sort=False).groups.items():
+        pos_list = list(idxs)
+        if len(pos_list) < 2:
+            continue
+        for k in range(1, len(pos_list)):
+            cur_i = pos_list[k]
+            if not math.isnan(rev_t2_final[cur_i]):
+                continue
+            prev_i = _earlier_filing(pos_list, k, 300, 430, 365)
+            if prev_i is not None:
+                pv = df.at[prev_i, "revenue_prior_in_filing"]
+                if pd.notna(pv) and float(pv) > 0:
+                    rev_t2_final[cur_i] = float(pv)
+                    continue
+            t2_i = _earlier_filing(pos_list, k, 650, 800, 730)
+            if t2_i is not None:
+                tv = df.at[t2_i, "revenue"]
+                if pd.notna(tv) and float(tv) > 0:
+                    rev_t2_final[cur_i] = float(tv)
+
     df["revenue_prior"] = rev_prior_final
+    df["revenue_t2"] = rev_t2_final
     df["shares_dilution_curr"] = sh_curr_final
     df["shares_dilution_prior"] = sh_prior_final
 
-    # Compute derived ratios cleanly
+    # Compute derived ratios cleanly. Rule-of-40 caps growth at 100% and FCF margin at 50%.
     df["yoy_rev_growth"] = np.where(
         (df["revenue"].notna()) & (df["revenue_prior"].notna()) & (df["revenue_prior"] > 0),
         df["revenue"] / df["revenue_prior"] - 1.0,
         np.nan,
     )
+    df["yoy_rev_growth_prior"] = np.where(
+        (df["revenue_prior"].notna()) & (df["revenue_t2"].notna()) & (df["revenue_t2"] > 0),
+        df["revenue_prior"] / df["revenue_t2"] - 1.0,
+        np.nan,
+    )
     df["gross_margin"] = np.where(
         (df["gross_profit"].notna()) & (df["revenue"].notna()) & (df["revenue"] > 0),
         df["gross_profit"] / df["revenue"],
+        np.nan,
+    )
+    df["operating_margin"] = np.where(
+        (df["operating_income"].notna()) & (df["revenue"].notna()) & (df["revenue"] > 0),
+        df["operating_income"] / df["revenue"],
         np.nan,
     )
     df["fcf_margin"] = np.where(
@@ -671,7 +841,9 @@ def enrich_annual_comparatives(annual_df: pd.DataFrame) -> pd.DataFrame:
             np.nan,
         ),
     )
-    df["rule_of_40"] = (df["yoy_rev_growth"] + df["fcf_margin"]) * 100.0
+    yoy_cap = np.minimum(df["yoy_rev_growth"], RULE40_MAX_YOY)
+    fcf_cap = np.minimum(df["fcf_margin"], RULE40_MAX_FCF_MARGIN)
+    df["rule_of_40"] = (yoy_cap + fcf_cap) * 100.0
     return df
 
 
@@ -770,6 +942,19 @@ class SecXbrlLoader:
             )
         return parse_xbrl_quarter_frames(sub_df, num_df, company_tickers_by_cik, quarter=quarter)
 
+    def _parsed_cache_current(self, quarter: str) -> bool:
+        ql = quarter.lower()
+        p_10k = self.parsed_dir / f"{ql}_10k.parquet"
+        p_10q = self.parsed_dir / f"{ql}_10q.parquet"
+        p_aud = self.parsed_dir / f"{ql}_audit.json"
+        if not (p_10k.exists() and p_10q.exists() and p_aud.exists()):
+            return False
+        try:
+            aud = json.loads(p_aud.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        return aud.get("parser_version") == PARSER_VERSION
+
     def load_quarters(
         self,
         quarters: tuple[str, ...] = DEFAULT_XBRL_QUARTERS,
@@ -777,7 +962,20 @@ class SecXbrlLoader:
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
         """Load & cache all requested SEC XBRL quarters into enriched 10-K and 10-Q tables."""
         company_tickers = load_sec_company_tickers_map(self.data_root, self.user_agent)
-        discovered = self.discover_quarter_links()
+        need_download = False
+        for q in quarters:
+            ql = q.lower()
+            local_zip = self.zips_dir / f"{ql}.zip"
+            zip_ok = local_zip.exists() and local_zip.stat().st_size > 100_000
+            if (force_reparse or not self._parsed_cache_current(ql)) and not zip_ok:
+                need_download = True
+                break
+        discovered: dict[str, str] = {}
+        if need_download:
+            try:
+                discovered = self.discover_quarter_links()
+            except (requests.RequestException, OSError) as exc:
+                log.warning("SEC XBRL index lookup failed (%s); using local zips only", exc)
 
         annual_frames: list[pd.DataFrame] = []
         quarterly_frames: list[pd.DataFrame] = []
@@ -792,7 +990,7 @@ class SecXbrlLoader:
             p_aud = self.parsed_dir / f"{ql}_audit.json"
             url = discovered.get(ql)
 
-            if not force_reparse and p_10k.exists() and p_10q.exists() and p_aud.exists():
+            if not force_reparse and self._parsed_cache_current(ql):
                 df_k = pd.read_parquet(p_10k)
                 df_q = pd.read_parquet(p_10q)
                 aud_q = json.loads(p_aud.read_text())
@@ -804,7 +1002,11 @@ class SecXbrlLoader:
                 downloaded_quarters.append(ql)
                 continue
 
-            if url is None:
+            local_zip = self.zips_dir / f"{ql}.zip"
+            if local_zip.exists() and local_zip.stat().st_size > 100_000 and zipfile.is_zipfile(local_zip):
+                zip_path: Path | None = local_zip
+                url = url or f"local-cache:{local_zip.name}"
+            elif url is None:
                 fallback_urls = [
                     f"{SEC_BASE_URL}/files/dera/data/financial-statement-data-sets/{ql}.zip",
                     f"{SEC_BASE_URL}/files/datastandardsinnovation/data/financial-statement-data-sets/{ql}.zip",
@@ -822,7 +1024,9 @@ class SecXbrlLoader:
                 unavailable_quarters.append(ql)
                 continue
 
+            log.info("Parsing SEC XBRL %s from %s", ql, zip_path.name)
             df_k, df_q, aud_q = self.parse_zip_file(zip_path, ql, company_tickers)
+            aud_q["parser_version"] = PARSER_VERSION
             aud_q["source_url"] = url
             aud_q["zip_bytes"] = int(zip_path.stat().st_size)
             df_k.to_parquet(p_10k, index=False)
@@ -855,6 +1059,7 @@ class SecXbrlLoader:
                 res_totals[k] = res_totals.get(k, 0) + int(v)
 
         manifest = {
+            "parser_version": PARSER_VERSION,
             "requested_quarters": list(quarters),
             "downloaded_quarters": downloaded_quarters,
             "unavailable_quarters": unavailable_quarters,

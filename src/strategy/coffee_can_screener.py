@@ -17,11 +17,13 @@ Strict Anti-Bias Guarantees:
 - **Two Locked Portfolio Rules:**
   - ``v10a_annual_top5``: Rebalance once per year (first trading day of April)
     equally into the current Top 5 Rule-of-40 qualifiers. No intra-year price stops.
-  - ``v10b_coffee_can_thesis_watch``: Buy Top 5 cohort, hold winners up to 3 years
-    (replacing only exited slots at subsequent April rebalances); exit early ONLY
-    on a fundamental thesis break (2 consecutive 10-Q/10-K filings with negative
-    YoY revenue growth, OR cash runway < 12 months), checked strictly on filing
-    date (exit at next trading day's Open).
+  - ``v10b_coffee_can_thesis_watch``: Buy Top 5 cohort, hold winners up to 3 years.
+    Exit early ONLY on a fundamental thesis break (2 consecutive 10-Q/10-K filings
+    with negative YoY revenue growth, OR TTM cash runway < 12 months). Runway uses
+    trailing-twelve-month free cash flow, never a single quarter. A confirmed
+    break exits at the next trading day's Open and that freed slot is redeployed
+    the same morning into the highest-ranked qualifier whose filings are dated
+    ``filed <=`` the exit decision date.
 - **Honest Survivorship Audit & Penalized Sensitivity:** Logs exact unmatched /
   early-delisted rates per vintage (IS vs Blind OOS) and runs side-by-side
   Raw-Matched and Survivorship-Penalized (``-50%``) evaluations in Part A and Part B.
@@ -30,6 +32,7 @@ Strict Anti-Bias Guarantees:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal
@@ -49,6 +52,7 @@ from src.backtest.metrics import (
 )
 from src.config import MetricsConfig
 from src.data.sec_form4_loader import is_allowed_us_common_stock, is_excluded_non_common_issuer
+from src.data.sec_xbrl_loader import RULE40_MAX_FCF_MARGIN, RULE40_MAX_YOY
 from src.domain.models import BarSeries
 
 US_PERIODS_PER_YEAR = 252
@@ -78,12 +82,15 @@ class CoffeeCanConfig(_Frozen):
     # Sector / universe exclusions
     sic_exclude_min: int = 6000
     sic_exclude_max: int = 6999
+    sic_extractive_min: int = 1000
+    sic_extractive_max: int = 1499
 
     # Fundamental filters (strictly from latest 10-K filed <= rebalance_date)
     max_filing_age_days: int = Field(400, ge=180, le=730)
     min_revenue_usd: float = Field(50_000_000.0, gt=0.0)
     min_yoy_rev_growth: float = Field(0.25, ge=-1.0)
     min_gross_margin: float = Field(0.50, ge=0.0, le=1.0)
+    min_operating_margin: float = Field(0.10, ge=-1.0, le=5.0)
     max_gross_margin_sanity: float = Field(1.00, ge=0.5, le=1.05)
     min_cash_runway_years_if_fcf_neg: float = Field(2.0, gt=0.0)  # 24 months
     max_debt_to_equity: float = Field(1.0, ge=0.0)
@@ -133,8 +140,12 @@ class FundamentalCandidate(BaseModel):
     period_date: date
     revenue_usd: float
     revenue_prior_usd: float
+    revenue_t2_usd: float
     yoy_rev_growth: float
+    yoy_rev_growth_prior: float
     gross_margin: float
+    operating_income_usd: float
+    operating_margin: float
     fcf_usd: float
     fcf_margin: float
     cash_total_usd: float | None
@@ -228,6 +239,22 @@ class CoffeeCanPortfolioResult(BaseModel):
     total_slippage_usd: float
 
 
+def _is_missing(v: Any) -> bool:
+    """True for None / NaN. False for 0, False, and ordinary numbers."""
+    if v is None:
+        return True
+    if isinstance(v, (bool, np.bool_)):
+        return False
+    if isinstance(v, (float, np.floating)):
+        return bool(math.isnan(float(v)))
+    if isinstance(v, (int, np.integer)):
+        return False
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
 def first_trading_day_of_april(spy_cal: pd.DatetimeIndex, year: int) -> date:
     """Return the first US trading day in April of ``year`` on ``spy_cal``."""
     apr = spy_cal[(spy_cal.year == year) & (spy_cal.month == 4)]
@@ -253,11 +280,16 @@ def screen_fundamentals_asof(
     counts = {
         "total_10k_asof_fresh": 0,
         "excluded_sic_financial_reit_spac": 0,
+        "excluded_sic_extractive": 0,
         "excluded_non_common_name": 0,
+        "excluded_missing_capex": 0,
         "excluded_missing_core_fields": 0,
         "excluded_revenue_lt_50m": 0,
+        "excluded_single_year_revenue_spike": 0,
         "excluded_rev_growth_lt_25pct": 0,
         "excluded_gross_margin_lt_50pct": 0,
+        "excluded_operating_margin_lt_10pct": 0,
+        "excluded_fcf_gt_revenue": 0,
         "excluded_survival_fcf_runway": 0,
         "excluded_equity_or_debt_to_equity": 0,
         "excluded_share_dilution_gt_5pct": 0,
@@ -293,6 +325,9 @@ def screen_fundamentals_asof(
         if cfg.sic_exclude_min <= sic <= cfg.sic_exclude_max:
             counts["excluded_sic_financial_reit_spac"] += 1
             continue
+        if cfg.sic_extractive_min <= sic <= cfg.sic_extractive_max:
+            counts["excluded_sic_extractive"] += 1
+            continue
 
         name = str(row.name or "").strip()
         ticker = str(row.ticker or "").strip()
@@ -300,10 +335,20 @@ def screen_fundamentals_asof(
             counts["excluded_non_common_name"] += 1
             continue
 
+        capex_flag = getattr(row, "capex_reported", False)
+        capex_raw = getattr(row, "capex", None)
+        capex_reported = (not _is_missing(capex_flag)) and bool(capex_flag)
+        if (not capex_reported) or _is_missing(capex_raw):
+            counts["excluded_missing_capex"] += 1
+            continue
+
         rev = row.revenue
         rev_p = row.revenue_prior
+        rev_t2 = getattr(row, "revenue_t2", None)
         yoy_g = row.yoy_rev_growth
         gm = row.gross_margin
+        op_inc = getattr(row, "operating_income", None)
+        op_m = getattr(row, "operating_margin", None)
         fcf = row.fcf
         fcf_m = row.fcf_margin
         cash = row.cash_total
@@ -312,11 +357,9 @@ def screen_fundamentals_asof(
         dte = row.debt_to_equity
         sh_out = row.shares_outstanding
         dil = row.yoy_share_dilution
-        r40 = row.rule_of_40
 
-        # Check required fields
-        req = (rev, rev_p, yoy_g, gm, fcf, fcf_m, eq, debt, dte, sh_out, dil, r40)
-        if any(v is None or (isinstance(v, (float, np.floating)) and math.isnan(float(v))) for v in req):
+        req = (rev, rev_p, yoy_g, gm, fcf, fcf_m, eq, debt, dte, sh_out, dil)
+        if any(_is_missing(v) for v in req):
             counts["excluded_missing_core_fields"] += 1
             continue
 
@@ -331,11 +374,18 @@ def screen_fundamentals_asof(
         dte_f = float(dte)
         sh_f = float(sh_out)
         dil_f = float(dil)
-        r40_f = float(r40)
-        cash_f = None if (cash is None or (isinstance(cash, (float, np.floating)) and math.isnan(float(cash)))) else float(cash)
+        cash_f = None if _is_missing(cash) else float(cash)
 
-        if sh_f <= 0 or rev_f < cfg.min_revenue_usd:
+        if sh_f <= 0 or rev_f < cfg.min_revenue_usd or rev_pf < cfg.min_revenue_usd:
             counts["excluded_revenue_lt_50m"] += 1
+            continue
+        if _is_missing(rev_t2):
+            counts["excluded_single_year_revenue_spike"] += 1
+            continue
+        rev_t2f = float(rev_t2)
+        # Two consecutive years of positive growth: Rev_t > Rev_t-1 > Rev_t-2.
+        if not (rev_f > rev_pf > rev_t2f):
+            counts["excluded_single_year_revenue_spike"] += 1
             continue
         if yoy_gf < cfg.min_yoy_rev_growth:
             counts["excluded_rev_growth_lt_25pct"] += 1
@@ -343,6 +393,17 @@ def screen_fundamentals_asof(
         if gm_f < cfg.min_gross_margin or gm_f > cfg.max_gross_margin_sanity:
             counts["excluded_gross_margin_lt_50pct"] += 1
             continue
+        if _is_missing(op_m) or float(op_m) < cfg.min_operating_margin:
+            counts["excluded_operating_margin_lt_10pct"] += 1
+            continue
+        if fcf_f > rev_f:
+            counts["excluded_fcf_gt_revenue"] += 1
+            continue
+
+        op_mf = float(op_m)
+        op_inc_f = float(op_inc) if not _is_missing(op_inc) else op_mf * rev_f
+        yoy_prior = (rev_pf / rev_t2f - 1.0) if rev_t2f > 0 else float("nan")
+        r40_f = (min(yoy_gf, RULE40_MAX_YOY) + min(fcf_mf, RULE40_MAX_FCF_MARGIN)) * 100.0
 
         # Survival guardrail: FCF > 0 OR cash runway >= 24 months (Cash / abs(FCF) >= 2.0)
         if fcf_f > 0.0:
@@ -383,8 +444,12 @@ def screen_fundamentals_asof(
                 period_date=pd.Timestamp(row.period_date).date(),
                 revenue_usd=rev_f,
                 revenue_prior_usd=rev_pf,
+                revenue_t2_usd=rev_t2f,
                 yoy_rev_growth=yoy_gf,
+                yoy_rev_growth_prior=yoy_prior,
                 gross_margin=gm_f,
+                operating_income_usd=op_inc_f,
+                operating_margin=op_mf,
                 fcf_usd=fcf_f,
                 fcf_margin=fcf_mf,
                 cash_total_usd=cash_f,
@@ -868,8 +933,12 @@ def run_coffee_can_event_study(
                 "filed_date": str(c.filed_date),
                 "period_date": str(c.period_date),
                 "revenue_m": round(c.revenue_usd / 1e6, 1),
+                "revenue_prior_m": round(c.revenue_prior_usd / 1e6, 1),
+                "revenue_t2_m": round(c.revenue_t2_usd / 1e6, 1),
                 "yoy_rev_growth_pct": round(c.yoy_rev_growth * 100.0, 1),
+                "yoy_rev_growth_prior_pct": round(c.yoy_rev_growth_prior * 100.0, 1),
                 "gross_margin_pct": round(c.gross_margin * 100.0, 1),
+                "operating_margin_pct": round(c.operating_margin * 100.0, 1),
                 "fcf_margin_pct": round(c.fcf_margin * 100.0, 1),
                 "yoy_dilution_pct": round(c.yoy_share_dilution * 100.0, 2),
                 "debt_to_equity": round(c.debt_to_equity, 2),
@@ -921,38 +990,287 @@ def run_coffee_can_event_study(
     }
 
 
+def screen_replacement_candidates(
+    annual_df: pd.DataFrame,
+    decision_date: date,
+    bars: dict[str, BarSeries],
+    ticker_meta: dict[str, dict[str, str]],
+    spy_bars: BarSeries,
+    cfg: CoffeeCanConfig,
+    *,
+    survivorship_penalized: bool = False,
+) -> list[EvaluatedCandidate]:
+    """Rank point-in-time qualifiers using only filings with ``filed <= decision_date``."""
+    label = f"redeploy-{decision_date.isoformat()}"
+    cands, _ = screen_fundamentals_asof(annual_df, decision_date, cfg, vintage_label=label)
+    evaluated, _ = evaluate_vintage_candidates(cands, bars, ticker_meta, spy_bars, cfg)
+    if survivorship_penalized:
+        return [e for e in evaluated if e.status in ("qualified_matched", "unmatched_yfinance")]
+    return [e for e in evaluated if e.status == "qualified_matched"]
+
+
+def _opt_float(v: Any) -> float | None:
+    if _is_missing(v):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def _runway_months_from_fcf(fcf: float | None, cash: float | None) -> float | None:
+    """Months of cash against a trailing-twelve-month free-cash-flow burn.
+
+    Positive TTM FCF → infinite runway. Missing TTM FCF → ``None`` (no false break).
+    A single quarter is never annualized here.
+    """
+    if fcf is None:
+        return None
+    if fcf > 0.0:
+        return float("inf")
+    if fcf < 0.0 and cash is not None and cash > 0.0:
+        return (cash / abs(fcf)) * 12.0
+    return None
+
+
+def _has_ttm_flow_columns(quarterly_df: pd.DataFrame) -> bool:
+    if quarterly_df is None or quarterly_df.empty:
+        return False
+    return "ytd_fcf" in quarterly_df.columns or "q_fcf" in quarterly_df.columns
+
+
+def _qtrs_int(v: Any) -> int | None:
+    f = _opt_float(v)
+    if f is None:
+        return None
+    return int(round(f))
+
+
+def _find_prev_ytd(
+    flows: list[dict[str, Any]],
+    period: pd.Timestamp,
+    want_qtrs: int,
+    know_by: pd.Timestamp,
+) -> dict[str, Any] | None:
+    """Earlier same-year YTD flow already filed by ``know_by``."""
+    best: dict[str, Any] | None = None
+    best_dist = 10_000
+    for row in flows:
+        if row["ytd_qtrs"] != want_qtrs or row["ytd_fcf"] is None or row["filed"] > know_by:
+            continue
+        gap = (period - row["period"]).days
+        if 70 <= gap <= 120:
+            dist = abs(gap - 91)
+            if best is None or dist < best_dist or (dist == best_dist and row["filed"] > best["filed"]):
+                best = row
+                best_dist = dist
+    return best
+
+
+def _standalone_fcf_flows(
+    q_flows: list[dict[str, Any]],
+    annual_flows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Standalone quarterly FCF. Q4 is FY 10-K minus Q3 YTD when both are known."""
+    standalones: list[dict[str, Any]] = []
+    for row in q_flows:
+        fcf: float | None = None
+        if row["q_fcf"] is not None:
+            fcf = row["q_fcf"]
+        elif row["ytd_qtrs"] == 1 and row["ytd_fcf"] is not None:
+            fcf = row["ytd_fcf"]
+        elif row["ytd_qtrs"] in (2, 3) and row["ytd_fcf"] is not None:
+            prev = _find_prev_ytd(q_flows, row["period"], row["ytd_qtrs"] - 1, row["filed"])
+            if prev is not None:
+                fcf = float(row["ytd_fcf"]) - float(prev["ytd_fcf"])
+        if fcf is None:
+            continue
+        standalones.append({"period": row["period"], "filed": row["filed"], "fcf": fcf})
+
+    for ann in annual_flows:
+        if ann["fcf"] is None:
+            continue
+        prev_q3 = _find_prev_ytd(q_flows, ann["period"], 3, ann["filed"])
+        if prev_q3 is None:
+            continue
+        standalones.append({
+            "period": ann["period"],
+            "filed": ann["filed"],
+            "fcf": float(ann["fcf"]) - float(prev_q3["ytd_fcf"]),
+        })
+    return standalones
+
+
+def _ttm_fcf_asof(
+    standalones: list[dict[str, Any]],
+    asof_period: pd.Timestamp,
+    asof_filed: pd.Timestamp,
+) -> float | None:
+    """Sum of the last four contiguous standalone quarters known by ``asof_filed``."""
+    by_period: dict[pd.Timestamp, dict[str, Any]] = {}
+    for row in standalones:
+        if row["filed"] > asof_filed or row["period"] > asof_period:
+            continue
+        prev = by_period.get(row["period"])
+        if prev is None or row["filed"] >= prev["filed"]:
+            by_period[row["period"]] = row
+    ordered = [by_period[p] for p in sorted(by_period)]
+    if len(ordered) < 4:
+        return None
+    last4 = ordered[-4:]
+    if abs((asof_period - last4[-1]["period"]).days) > 20:
+        return None
+    gaps = [(last4[i]["period"] - last4[i - 1]["period"]).days for i in range(1, 4)]
+    span = (last4[-1]["period"] - last4[0]["period"]).days
+    if not (250 <= span <= 400 and all(60 <= g <= 130 for g in gaps)):
+        return None
+    return float(sum(row["fcf"] for row in last4))
+
+
+def _latest_annual_fcf(
+    annual_flows: list[dict[str, Any]],
+    asof_filed: pd.Timestamp,
+    asof_period: pd.Timestamp,
+) -> float | None:
+    best: dict[str, Any] | None = None
+    horizon = asof_period + pd.Timedelta(days=20)
+    for row in annual_flows:
+        if row["fcf"] is None or row["filed"] > asof_filed or row["period"] > horizon:
+            continue
+        if best is None or (row["filed"], row["period"]) > (best["filed"], best["period"]):
+            best = row
+    return None if best is None else float(best["fcf"])
+
+
+def _build_ttm_thesis_events(
+    annual_df: pd.DataFrame,
+    quarterly_df: pd.DataFrame,
+) -> dict[str, list[dict[str, Any]]]:
+    """Thesis events whose runway is TTM FCF, or the latest 10-K if quarters are incomplete."""
+    q_groups: dict[str, list[dict[str, Any]]] = {}
+    if not quarterly_df.empty:
+        for cik, grp in quarterly_df.groupby(quarterly_df["cik"].astype(str), sort=False):
+            flows: list[dict[str, Any]] = []
+            for rec in grp.to_dict(orient="records"):
+                flows.append({
+                    "adsh": str(rec.get("adsh", "")),
+                    "filed": pd.Timestamp(rec["filed_date"]),
+                    "period": pd.Timestamp(rec["period_date"]),
+                    "yoy": _opt_float(rec.get("yoy_rev_growth")),
+                    "cash": _opt_float(rec.get("cash_total")),
+                    "q_fcf": _opt_float(rec.get("q_fcf")),
+                    "ytd_fcf": _opt_float(rec.get("ytd_fcf")),
+                    "ytd_qtrs": _qtrs_int(rec.get("ytd_qtrs")),
+                })
+            flows.sort(key=lambda r: (r["filed"], r["period"], r["adsh"]))
+            q_groups[str(cik)] = flows
+
+    a_groups: dict[str, list[dict[str, Any]]] = {}
+    if annual_df is not None and not annual_df.empty:
+        for cik, grp in annual_df.groupby(annual_df["cik"].astype(str), sort=False):
+            flows = []
+            for rec in grp.to_dict(orient="records"):
+                flows.append({
+                    "adsh": str(rec.get("adsh", "")),
+                    "filed": pd.Timestamp(rec["filed_date"]),
+                    "period": pd.Timestamp(rec["period_date"]),
+                    "yoy": _opt_float(rec.get("yoy_rev_growth")),
+                    "cash": _opt_float(rec.get("cash_total")),
+                    "fcf": _opt_float(rec.get("fcf")),
+                })
+            a_groups[str(cik)] = flows
+
+    events_by_cik: dict[str, list[dict[str, Any]]] = {}
+    for cik in set(q_groups) | set(a_groups):
+        q_flows = q_groups.get(cik, [])
+        a_flows = a_groups.get(cik, [])
+        standalones = _standalone_fcf_flows(q_flows, a_flows)
+        events: list[dict[str, Any]] = []
+        for row in q_flows:
+            ttm = _ttm_fcf_asof(standalones, row["period"], row["filed"])
+            source = "ttm_4q"
+            if ttm is None:
+                ttm = _latest_annual_fcf(a_flows, row["filed"], row["period"])
+                source = "annual_10k" if ttm is not None else "unavailable"
+            events.append({
+                "filed_date": row["filed"].date(),
+                "form": "10-Q",
+                "adsh": row["adsh"],
+                "yoy_rev_growth": row["yoy"],
+                "cash_runway_months": _runway_months_from_fcf(ttm, row["cash"]),
+                "runway_source": source,
+                "ttm_fcf": ttm,
+            })
+        for row in a_flows:
+            events.append({
+                "filed_date": row["filed"].date(),
+                "form": "10-K",
+                "adsh": row["adsh"],
+                "yoy_rev_growth": row["yoy"],
+                "cash_runway_months": _runway_months_from_fcf(row["fcf"], row["cash"]),
+                "runway_source": "annual_10k" if row["fcf"] is not None else "unavailable",
+                "ttm_fcf": row["fcf"],
+            })
+        events.sort(key=lambda x: (x["filed_date"], x["adsh"]))
+        if events:
+            events_by_cik[cik] = events
+    return events_by_cik
+
+
 def build_thesis_watch_events(
     annual_df: pd.DataFrame,
     quarterly_df: pd.DataFrame,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Build strictly chronological ``filed_date`` stream of 10-Q/10-K thesis checks per ``cik``."""
+    """Build a ``filed_date`` stream of 10-Q/10-K thesis checks per ``cik``.
+
+    When quarterly rows carry YTD / standalone cash-flow columns, cash runway is
+    trailing-twelve-month FCF (last four standalone quarters, or the latest
+    ``qtrs == 4`` 10-K if that breakdown is incomplete). A lone quarter is never
+    annualized. Rows that already carry ``cash_runway_months`` and no flow
+    columns keep that precomputed TTM figure (unit-test fixtures).
+    """
+    if _has_ttm_flow_columns(quarterly_df):
+        return _build_ttm_thesis_events(annual_df, quarterly_df)
+
     events_by_cik: dict[str, list[dict[str, Any]]] = {}
 
-    if not quarterly_df.empty:
+    if quarterly_df is not None and not quarterly_df.empty:
+        has_runway = "cash_runway_months" in quarterly_df.columns
         for row in quarterly_df.itertuples(index=False):
             f_dt = pd.Timestamp(row.filed_date).date()
             yoy = None if pd.isna(row.yoy_rev_growth) else float(row.yoy_rev_growth)
-            rw = None if pd.isna(row.cash_runway_months) else float(row.cash_runway_months)
+            rw_raw = getattr(row, "cash_runway_months", None) if has_runway else None
+            rw = None if _is_missing(rw_raw) else float(rw_raw)
             events_by_cik.setdefault(str(row.cik), []).append({
                 "filed_date": f_dt,
                 "form": "10-Q",
                 "adsh": str(row.adsh),
                 "yoy_rev_growth": yoy,
                 "cash_runway_months": rw,
+                "runway_source": "provided",
             })
 
-    if not annual_df.empty:
+    if annual_df is not None and not annual_df.empty:
         for row in annual_df.itertuples(index=False):
             f_dt = pd.Timestamp(row.filed_date).date()
-            yoy = None if pd.isna(row.yoy_rev_growth) else float(row.yoy_rev_growth)
+            yoy_raw = getattr(row, "yoy_rev_growth", None)
+            yoy = None if _is_missing(yoy_raw) else float(yoy_raw)
             rw_yr = getattr(row, "cash_runway_years", np.nan)
-            rw = None if pd.isna(rw_yr) else (float("inf") if math.isinf(float(rw_yr)) else float(rw_yr) * 12.0)
+            if _is_missing(rw_yr):
+                rw = None
+            else:
+                rw_f = float(rw_yr)
+                rw = float("inf") if math.isinf(rw_f) else rw_f * 12.0
             events_by_cik.setdefault(str(row.cik), []).append({
                 "filed_date": f_dt,
                 "form": "10-K",
                 "adsh": str(row.adsh),
                 "yoy_rev_growth": yoy,
                 "cash_runway_months": rw,
+                "runway_source": "annual_10k",
             })
 
     for cik in events_by_cik:
@@ -994,8 +1312,14 @@ def run_coffee_can_portfolio_backtest(
     initial_capital_eur: float,
     window_label: str = "FULL",
     survivorship_penalized: bool = False,
+    replacement_screen: Callable[[date], list[EvaluatedCandidate]] | None = None,
 ) -> CoffeeCanPortfolioResult:
-    """Part B: Simulate ``v10a_annual_top5`` or ``v10b_coffee_can_thesis_watch`` on IBKR Cash Account."""
+    """Part B: Simulate ``v10a_annual_top5`` or ``v10b_coffee_can_thesis_watch`` on IBKR Cash Account.
+
+    ``replacement_screen(decision_date)`` ranks current qualifiers using only
+    information filed on or before the thesis-break decision date. v10b buys the
+    top name not already held at the next trading day's Open.
+    """
     spy_cal = spy_bars.frame.index.sort_values()
     cal = spy_cal[(spy_cal >= pd.Timestamp(window_start)) & (spy_cal <= pd.Timestamp(window_end))]
     if cal.empty:
@@ -1026,8 +1350,10 @@ def run_coffee_can_portfolio_backtest(
     comm = cfg.commission_per_side_usd
     penalty_mult = 1.0 + cfg.survivorship_penalty_return
 
-    # Queued rebalance buys: list of (target_buy_ts, vintage, desired_candidates_list)
-    pending_rebalance_buys: list[tuple[pd.Timestamp, str, list[EvaluatedCandidate]]] = []
+    # (buy_ts, label, targets, max_new_buys or None to fill to top_n, settlement retries left)
+    pending_rebalance_buys: list[
+        tuple[pd.Timestamp, str, list[EvaluatedCandidate], int | None, int]
+    ] = []
 
     def _settle_dt(idx_i: int) -> pd.Timestamp:
         if cfg.settlement_days <= 0:
@@ -1187,24 +1513,26 @@ def run_coffee_can_portfolio_backtest(
                 _close_pos(pos, ts, pos.last_adj_close, pos.queued_exit_reason, i)
         open_positions = survivors
 
-        # 3. Execute queued rebalance buys at Open (strictly after T+1 settlement if sells occurred)
+        # 3. Execute queued rebalance / redeploy buys at Open.
+        #    Sale proceeds settle T+1, so a same-morning redeploy spends cash that
+        #    was already settled. Anything still unfilled retries once that cash settles.
         if pending_rebalance_buys:
-            next_pend_buys: list[tuple[pd.Timestamp, str, list[EvaluatedCandidate]]] = []
-            for buy_ts, vlabel, targets in pending_rebalance_buys:
+            next_pend_buys: list[tuple[pd.Timestamp, str, list[EvaluatedCandidate], int | None, int]] = []
+            for buy_ts, vlabel, targets, max_new, retries_left in pending_rebalance_buys:
                 if buy_ts > ts:
-                    next_pend_buys.append((buy_ts, vlabel, targets))
+                    next_pend_buys.append((buy_ts, vlabel, targets, max_new, retries_left))
                     continue
-                # Fill open slots up to cfg.top_n
                 held_ciks = {p.ev.candidate.cik for p in open_positions}
                 held_tickers = {p.ev.candidate.ticker for p in open_positions if p.ev.candidate.ticker}
                 open_mtm = sum(p.adj_qty * p.last_adj_close for p in open_positions)
                 settled_equity = settled_cash + open_mtm
-                slots_to_fill = max(0, cfg.top_n - len(open_positions))
-                if slots_to_fill > 0:
-                    # Allocate equal slice of settled equity (capped by settled cash / remaining slots)
+                room = max(0, cfg.top_n - len(open_positions))
+                buy_cap = room if max_new is None else min(room, max_new)
+                bought = 0
+                if buy_cap > 0:
                     slot_budget = cfg.target_slot_pct * settled_equity
                     for cand_ev in targets:
-                        if len(open_positions) >= cfg.top_n:
+                        if bought >= buy_cap or len(open_positions) >= cfg.top_n:
                             break
                         if cand_ev.candidate.cik in held_ciks or (
                             cand_ev.candidate.ticker and cand_ev.candidate.ticker in held_tickers
@@ -1216,10 +1544,17 @@ def run_coffee_can_portfolio_backtest(
                             held_ciks.add(cand_ev.candidate.cik)
                             if cand_ev.candidate.ticker:
                                 held_tickers.add(cand_ev.candidate.ticker)
+                            bought += 1
+                still_needed = 0 if max_new is None else max(0, max_new - bought)
+                if still_needed > 0 and retries_left > 0 and cfg.settlement_days > 0 and i + cfg.settlement_days < len(cal):
+                    next_pend_buys.append(
+                        (cal[i + cfg.settlement_days], vlabel, targets, still_needed, retries_left - 1)
+                    )
             pending_rebalance_buys = next_pend_buys
 
         # 4. Close MTM, early delisting check, and v10b causal thesis-break check
         survivors_close: list[_HeldPos] = []
+        thesis_break_dates: list[date] = []
         for pos in open_positions:
             if pos.is_synthetic_unmatched:
                 pos.bars_held += 1
@@ -1267,13 +1602,37 @@ def run_coffee_can_portfolio_backtest(
                             pos.consec_neg_rev = 0
                     if pos.consec_neg_rev >= cfg.thesis_break_consec_neg_rev:
                         pos.queued_exit_reason = "THESIS_BREAK_REV_DECLINE"
+                        thesis_break_dates.append(fdt)
                         break
                     if rw is not None and rw < cfg.thesis_break_min_runway_months:
                         pos.queued_exit_reason = "THESIS_BREAK_RUNWAY"
+                        thesis_break_dates.append(fdt)
                         break
 
             survivors_close.append(pos)
         open_positions = survivors_close
+
+        # 4b. v10b: redeploy each thesis-break slot at the next open.
+        #     Ranking is frozen on the filing date (decision date), so a filing
+        #     that arrives on the exit morning cannot enter the list.
+        if (
+            thesis_break_dates
+            and replacement_screen is not None
+            and cfg.rule == "v10b_coffee_can_thesis_watch"
+            and i + 1 < len(cal)
+        ):
+            decision = max(thesis_break_dates)
+            held_ciks = {p.ev.candidate.cik for p in open_positions}
+            held_tickers = {p.ev.candidate.ticker for p in open_positions if p.ev.candidate.ticker}
+            ranked = [
+                ev for ev in replacement_screen(decision)
+                if ev.candidate.cik not in held_ciks
+                and (not ev.candidate.ticker or ev.candidate.ticker not in held_tickers)
+            ]
+            if ranked:
+                pending_rebalance_buys.append(
+                    (cal[i + 1], f"redeploy-{decision.isoformat()}", ranked, len(thesis_break_dates), 1)
+                )
 
         # 5. Annual April Rebalance Signal Check (evaluated at close of first trading day of April)
         if ts in reb_ts_to_vintage and i + 1 < len(cal):
@@ -1310,7 +1669,7 @@ def run_coffee_can_portfolio_backtest(
                 buy_idx = min(i + 1 + cfg.settlement_days, len(cal) - 1)
             else:
                 buy_idx = i + 1
-            pending_rebalance_buys.append((cal[buy_idx], vlabel, top_targets))
+            pending_rebalance_buys.append((cal[buy_idx], vlabel, top_targets, None, 0))
 
         # 6. Record daily equity curve
         unsettled_tot = sum(amt for _, amt in unsettled)
